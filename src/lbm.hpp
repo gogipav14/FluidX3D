@@ -5,6 +5,9 @@
 #include "graphics.hpp"
 #include "units.hpp"
 #include "info.hpp"
+#ifdef SPECTRAL_OPS
+#include "spectral.hpp"
+#endif
 
 uint bytes_per_cell_host(); // returns the number of Bytes per cell allocated in host memory
 uint bytes_per_cell_device(); // returns the number of Bytes per cell allocated in device memory
@@ -63,6 +66,13 @@ private:
 	Kernel kernel_integrate_particles; // intgegrates particles forward in time and couples particles to fluid
 #endif // PARTICLES
 
+#ifdef SPECTRAL_OPS
+	SpectralOps* spectral = nullptr; // FFT-based spectral operations
+#endif // SPECTRAL_OPS
+#ifdef SPECTRAL_SUBGRID
+	Memory<float> nu_t; // eddy viscosity from spectral computation [N] - only 4 bytes/cell
+#endif // SPECTRAL_SUBGRID
+
 	void allocate(Device& device); // allocate all memory for data fields on host and device and set up kernels
 	string device_defines() const; // returns preprocessor constants for embedding in OpenCL C code
 
@@ -114,6 +124,16 @@ public:
 #ifdef PARTICLES
 	void enqueue_integrate_particles(const uint time_step_multiplicator=1u); // intgegrates particles forward in time and couples particles to fluid
 #endif // PARTICLES
+
+#ifdef SPECTRAL_SURFACE
+	void enqueue_spectral_smooth_phi(); // apply spectral Helmholtz smoothing to phi field
+#endif // SPECTRAL_SURFACE
+#ifdef SPECTRAL_SUBGRID
+	void enqueue_spectral_compute_nu_t(); // compute eddy viscosity using spectral gradients
+#endif // SPECTRAL_SUBGRID
+#ifdef SPECTRAL_TEMPERATURE
+	void enqueue_spectral_diffusion(); // apply spectral IMEX/ETD diffusion step
+#endif // SPECTRAL_TEMPERATURE
 
 	void increment_time_step(const uint steps=1u); // increment time step
 	void reset_time_step(); // reset time step

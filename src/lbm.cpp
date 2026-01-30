@@ -172,6 +172,17 @@ void LBM_Domain::allocate(Device& device) {
 #endif // FORCE_FIELD
 #endif // PARTICLES
 
+#ifdef SPECTRAL_OPS
+	if(get_D()==1u) { // Spectral operations only supported in single-GPU mode for Phase 1
+		spectral = new SpectralOps(device, Nx, Ny, Nz);
+#ifdef SPECTRAL_SUBGRID
+		nu_t = Memory<float>(device, N, 1u, false, true, 0.0f, false); // device only, 4 bytes/cell
+#endif // SPECTRAL_SUBGRID
+	} else {
+		print_warning("Spectral operations disabled for multi-GPU mode");
+	}
+#endif // SPECTRAL_OPS
+
 	if(get_D()>1u) allocate_transfer(device);
 }
 
@@ -251,6 +262,31 @@ void LBM_Domain::enqueue_integrate_particles(const uint time_step_multiplicator)
 	kernel_integrate_particles.set_parameters(3u, (float)time_step_multiplicator).enqueue_run();
 }
 #endif // PARTICLES
+
+#ifdef SPECTRAL_SURFACE
+void LBM_Domain::enqueue_spectral_smooth_phi() {
+	if(spectral && spectral->is_initialized()) {
+		spectral->enqueue_smooth_phi(phi, t);
+	}
+}
+#endif // SPECTRAL_SURFACE
+
+#ifdef SPECTRAL_SUBGRID
+void LBM_Domain::enqueue_spectral_compute_nu_t() {
+	if(spectral && spectral->is_initialized()) {
+		spectral->enqueue_compute_eddy_viscosity(u, nu_t);
+	}
+}
+#endif // SPECTRAL_SUBGRID
+
+#ifdef SPECTRAL_TEMPERATURE
+void LBM_Domain::enqueue_spectral_diffusion() {
+	if(spectral && spectral->is_initialized()) {
+		const float alpha_dt = alpha; // alpha * dt, where dt=1 in LBM units
+		spectral->enqueue_diffusion_step(T, alpha_dt);
+	}
+}
+#endif // SPECTRAL_TEMPERATURE
 
 void LBM_Domain::increment_time_step(const uint steps) {
 	t += (ulong)steps; // increment time step
@@ -892,6 +928,9 @@ void LBM::do_time_step() { // call kernel_stream_collide to perform one LBM time
 #ifdef SURFACE
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_surface_0();
 #endif // SURFACE
+#ifdef SPECTRAL_SUBGRID
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_spectral_compute_nu_t(); // compute spectral eddy viscosity before collision
+#endif // SPECTRAL_SUBGRID
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_stream_collide(); // run LBM stream_collide kernel after domain communication
 #if defined(SURFACE) || defined(GRAPHICS)
 	communicate_rho_u_flags(); // rho/u/flags halo data is required for SURFACE extension, and u halo data is required for Q-criterion rendering
@@ -902,6 +941,9 @@ void LBM::do_time_step() { // call kernel_stream_collide to perform one LBM time
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_surface_2();
 	communicate_flags();
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_surface_3();
+#ifdef SPECTRAL_SURFACE
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_spectral_smooth_phi(); // apply spectral Helmholtz smoothing to phi (respects smooth_cadence)
+#endif // SPECTRAL_SURFACE
 	communicate_phi_massex_flags();
 #endif // SURFACE
 	communicate_fi();
@@ -910,6 +952,9 @@ void LBM::do_time_step() { // call kernel_stream_collide to perform one LBM time
 	communicate_T(); // T halo data is required for field_slice rendering
 #endif // GRAPHICS
 	communicate_gi();
+#ifdef SPECTRAL_TEMPERATURE
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_spectral_diffusion(); // apply spectral IMEX/ETD diffusion step
+#endif // SPECTRAL_TEMPERATURE
 #endif // TEMPERATURE
 #ifdef PARTICLES
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_integrate_particles(); // intgegrate particles forward in time and couple particles to fluid

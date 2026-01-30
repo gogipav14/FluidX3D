@@ -24,6 +24,10 @@
 //#define SUBGRID // enables Smagorinsky-Lilly subgrid turbulence LES model to keep simulations with very large Reynolds number stable
 //#define PARTICLES // enables particles with immersed-boundary method (for 2-way coupling also activate VOLUME_FORCE and FORCE_FIELD; only supported in single-GPU)
 
+//#define SPECTRAL_SURFACE // enables FFT-based spectral smoothing for SURFACE phi field (requires SURFACE)
+//#define SPECTRAL_SUBGRID // enables FFT-based spectral eddy viscosity for SUBGRID LES (requires SUBGRID)
+//#define SPECTRAL_TEMPERATURE // enables FFT-based IMEX/ETD diffusion for TEMPERATURE (requires TEMPERATURE)
+
 //#define INTERACTIVE_GRAPHICS // enable interactive graphics; start/pause the simulation by pressing P; either Windows or Linux X11 desktop must be available; on Linux: change to "compile on Linux with X11" command in make.sh
 //#define INTERACTIVE_GRAPHICS_ASCII // enable interactive graphics in ASCII mode the console; start/pause the simulation by pressing P
 //#define GRAPHICS // run FluidX3D in the console, but still enable graphics functionality for writing rendered frames to the hard drive
@@ -102,3 +106,37 @@
 #define GRAPHICS
 #define UPDATE_FIELDS // to prevent flickering artifacts in interactive graphics
 #endif // INTERACTIVE_GRAPHICS || INTERACTIVE_GRAPHICS_ASCII
+
+// Spectral accelerator dependency checks and configuration
+#ifdef SPECTRAL_SURFACE
+#ifndef SURFACE
+#error "SPECTRAL_SURFACE requires SURFACE to be defined"
+#endif
+#endif // SPECTRAL_SURFACE
+
+#ifdef SPECTRAL_SUBGRID
+#ifndef SUBGRID
+#error "SPECTRAL_SUBGRID requires SUBGRID to be defined"
+#endif
+#ifndef UPDATE_FIELDS
+#define UPDATE_FIELDS // velocity must be current for spectral derivatives
+#endif
+#endif // SPECTRAL_SUBGRID
+
+#ifdef SPECTRAL_TEMPERATURE
+#ifndef TEMPERATURE
+#error "SPECTRAL_TEMPERATURE requires TEMPERATURE to be defined"
+#endif
+#endif // SPECTRAL_TEMPERATURE
+
+#if defined(SPECTRAL_SURFACE) || defined(SPECTRAL_SUBGRID) || defined(SPECTRAL_TEMPERATURE)
+#define SPECTRAL_OPS
+#endif // SPECTRAL_*
+
+// Spectral configuration parameters
+#ifndef SPECTRAL_SMOOTH_EVERY
+#define SPECTRAL_SMOOTH_EVERY 8u // smooth phi every N steps (default: 8)
+#endif
+#ifndef SPECTRAL_HELMHOLTZ_ALPHA
+#define SPECTRAL_HELMHOLTZ_ALPHA 1.0f // Helmholtz smoothing parameter
+#endif

@@ -7,6 +7,7 @@ no-target:
 	@echo "\033[91mError\033[0m: Please select one of these targets: make Linux-X11, make Linux, make macOS, make Android"
 
 Linux-X11 Linux macOS Android: LDFLAGS_OPENCL = -I./src/OpenCL/include
+Linux-X11 Linux macOS Android: LDFLAGS_VKFFT = -I./src
 
 Linux-X11 Linux: LDLIBS_OPENCL = -L./src/OpenCL/lib -lOpenCL
 macOS: LDLIBS_OPENCL = -framework OpenCL
@@ -20,7 +21,7 @@ Linux macOS Android: LDLIBS_X11 =
 
 Linux-X11 Linux macOS Android: bin/FluidX3D
 
-bin/FluidX3D: temp/graphics.o temp/info.o temp/kernel.o temp/lbm.o temp/lodepng.o temp/main.o temp/setup.o temp/shapes.o make.sh
+bin/FluidX3D: temp/graphics.o temp/info.o temp/kernel.o temp/lbm.o temp/lodepng.o temp/main.o temp/setup.o temp/shapes.o temp/spectral.o make.sh
 	@mkdir -p bin
 	$(CC) temp/*.o -o bin/FluidX3D $(CFLAGS) $(LDFLAGS_OPENCL) $(LDLIBS_OPENCL) $(LDFLAGS_X11) $(LDLIBS_X11)
 
@@ -36,9 +37,9 @@ temp/kernel.o: src/kernel.cpp src/kernel.hpp src/lodepng.hpp src/utilities.hpp
 	@mkdir -p temp
 	$(CC) -c src/kernel.cpp -o temp/kernel.o $(CFLAGS)
 
-temp/lbm.o: src/lbm.cpp src/defines.hpp src/graphics.hpp src/info.hpp src/lbm.hpp src/lodepng.hpp src/opencl.hpp src/units.hpp src/utilities.hpp make.sh
+temp/lbm.o: src/lbm.cpp src/defines.hpp src/graphics.hpp src/info.hpp src/lbm.hpp src/lodepng.hpp src/opencl.hpp src/spectral.hpp src/units.hpp src/utilities.hpp make.sh
 	@mkdir -p temp
-	$(CC) -c src/lbm.cpp -o temp/lbm.o $(CFLAGS) $(LDFLAGS_OPENCL)
+	$(CC) -c src/lbm.cpp -o temp/lbm.o $(CFLAGS) $(LDFLAGS_OPENCL) $(LDFLAGS_VKFFT)
 
 temp/lodepng.o: src/lodepng.cpp src/lodepng.hpp
 	@mkdir -p temp
@@ -55,6 +56,10 @@ temp/setup.o: src/setup.cpp src/defines.hpp src/graphics.hpp src/info.hpp src/lb
 temp/shapes.o: src/shapes.cpp src/shapes.hpp src/utilities.hpp make.sh
 	@mkdir -p temp
 	$(CC) -c src/shapes.cpp -o temp/shapes.o $(CFLAGS) $(LDFLAGS_OPENCL)
+
+temp/spectral.o: src/spectral.cpp src/spectral.hpp src/defines.hpp src/opencl.hpp src/utilities.hpp make.sh
+	@mkdir -p temp
+	$(CC) -c src/spectral.cpp -o temp/spectral.o $(CFLAGS) $(LDFLAGS_OPENCL) $(LDFLAGS_VKFFT)
 
 .PHONY: clean
 clean:
