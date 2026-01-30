@@ -1364,3 +1364,162 @@ void main_setup() { // benchmark; required extensions in defines.hpp: BENCHMARK,
 	lbm.run();
 	//lbm.run(1000u); lbm.u.read_from_device(); println(lbm.u.x[lbm.index(Nx/2u, Ny/2u, Nz/2u)]); wait(); // test for binary identity
 } /**/
+
+
+
+/*void main_setup() { // spectral mixing benchmark (dam break with turbulence); required extensions in defines.hpp: FP16S, VOLUME_FORCE, SURFACE, SUBGRID, SPECTRAL_SURFACE, SPECTRAL_SUBGRID, INTERACTIVE_GRAPHICS
+	// ################################################################## define simulation box size, viscosity and volume force ###################################################################
+	// Dam break with high Reynolds number - demonstrates spectral accelerators
+	// SPECTRAL_SURFACE: Smooths phi field with mass conservation
+	// SPECTRAL_SUBGRID: Computes eddy viscosity via spectral strain tensor
+	const uint L = 128u; // grid size (use power of 2 for efficient FFT)
+	const float nu = 0.005f; // kinematic viscosity (low value -> high Re)
+	const float g = -0.0003f; // gravity in -z direction
+	const float sigma = 0.0001f; // surface tension
+	LBM lbm(L, L*2u, L, nu, 0.0f, 0.0f, g, sigma);
+
+	// ###################################################################################### define geometry ######################################################################################
+	const uint Nx=lbm.get_Nx(), Ny=lbm.get_Ny(), Nz=lbm.get_Nz();
+
+	// Track initial fluid mass for conservation check
+	double initial_fluid_cells = 0.0;
+
+	parallel_for(lbm.get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lbm.coordinates(n, x, y, z);
+		// Dam break: fluid fills left quarter of domain up to 3/4 height
+		if(y < Ny/4u && z < Nz*3u/4u) {
+			lbm.flags[n] = TYPE_F;
+			lbm.rho[n] = 1.0f + 0.0003f * (float)(Nz*3u/4u - z); // hydrostatic pressure
+		}
+		// Solid walls on all sides except top
+		if(x==0u || x==Nx-1u || y==0u || y==Ny-1u || z==0u) {
+			lbm.flags[n] = TYPE_S;
+		}
+	});
+
+	// Count initial fluid cells (for mass conservation validation)
+	for(ulong n=0; n<lbm.get_N(); n++) {
+		if(lbm.flags[n] == TYPE_F) initial_fluid_cells += 1.0;
+	}
+
+	// ####################################################################### run simulation, export images and data ##########################################################################
+	lbm.graphics.visualization_modes = VIS_PHI_RASTERIZE|VIS_Q_CRITERION;
+
+	// Run with periodic mass conservation reporting
+	const ulong report_interval = 1000u;
+	const ulong total_steps = 50000u;
+
+	print_info("Spectral Mixing Benchmark Started");
+	print_info("Grid: " + to_string(Nx) + "x" + to_string(Ny) + "x" + to_string(Nz));
+	print_info("Initial fluid cells: " + to_string((ulong)initial_fluid_cells));
+	print_info("SPECTRAL_SMOOTH_EVERY = " + to_string(SPECTRAL_SMOOTH_EVERY));
+	print_info("SPECTRAL_HELMHOLTZ_ALPHA = " + to_string(SPECTRAL_HELMHOLTZ_ALPHA));
+	print_info("SPECTRAL_CS_DELTA_SQ = " + to_string(SPECTRAL_CS_DELTA_SQ));
+
+	for(ulong step=0; step<total_steps; step+=report_interval) {
+		lbm.run(report_interval);
+
+		// Compute current fluid volume (sum of phi for fluid+interface cells)
+		lbm.phi.read_from_device();
+		lbm.flags.read_from_device();
+		double fluid_volume = 0.0;
+		for(ulong n=0; n<lbm.get_N(); n++) {
+			const uchar flag = lbm.flags[n];
+			if(flag == TYPE_F || flag == TYPE_I) {
+				fluid_volume += (double)lbm.phi[n];
+			}
+		}
+
+		const double mass_error = (fluid_volume - initial_fluid_cells) / initial_fluid_cells * 100.0;
+		print_info("t=" + to_string(lbm.get_t()) + " fluid_volume=" + to_string(fluid_volume, 2) +
+		           " mass_error=" + to_string(mass_error, 4) + "%");
+	}
+
+	print_info("Spectral Mixing Benchmark Complete");
+} /**/
+
+
+
+/*void main_setup() { // spectral thermal mixing benchmark; required extensions in defines.hpp: FP16S, VOLUME_FORCE, TEMPERATURE, SPECTRAL_TEMPERATURE, INTERACTIVE_GRAPHICS
+	// ################################################################## define simulation box size, viscosity and volume force ###################################################################
+	// Thermal mixing with spectral diffusion acceleration
+	// SPECTRAL_TEMPERATURE: Uses ETD (Exponential Time Differencing) for exact diffusion
+	const uint L = 128u;
+	const float nu = 0.02f;
+	const float alpha = 0.1f; // thermal diffusivity (high value to test spectral diffusion)
+	const float beta = 0.001f; // thermal expansion coefficient
+	const float g = -0.0005f;
+	LBM lbm(L, L, L/2u, 1u, 1u, 1u, nu, 0.0f, 0.0f, g, 0.0f, alpha, beta);
+
+	// ###################################################################################### define geometry ######################################################################################
+	const uint Nx=lbm.get_Nx(), Ny=lbm.get_Ny(), Nz=lbm.get_Nz();
+	const uint threads = (uint)thread::hardware_concurrency();
+	vector<uint> seed(threads);
+	for(uint t=0u; t<threads; t++) seed[t] = 42u+t;
+
+	// Track initial temperature sum for energy conservation
+	double initial_T_sum = 0.0;
+
+	parallel_for(lbm.get_N(), threads, [&](ulong n, uint t) { uint x=0u, y=0u, z=0u; lbm.coordinates(n, x, y, z);
+		// Small velocity perturbation to trigger convection
+		lbm.u.x[n] = random_symmetric(seed[t], 0.01f);
+		lbm.u.y[n] = random_symmetric(seed[t], 0.01f);
+		lbm.u.z[n] = random_symmetric(seed[t], 0.01f);
+
+		// Hot blob in center, cold elsewhere
+		const float dx = (float)x - 0.5f*(float)Nx;
+		const float dy = (float)y - 0.5f*(float)Ny;
+		const float dz = (float)z - 0.5f*(float)Nz;
+		const float r = sqrt(dx*dx + dy*dy + dz*dz);
+		const float R = 0.2f * (float)L;
+
+		if(r < R) {
+			lbm.T[n] = 1.5f; // hot center
+		} else {
+			lbm.T[n] = 0.8f; // cold surroundings
+		}
+
+		// Hydrostatic pressure
+		lbm.rho[n] = units.rho_hydrostatic(fabs(g), (float)z, 0.5f*(float)Nz);
+
+		// Bottom and top walls
+		if(z==0u || z==Nz-1u) lbm.flags[n] = TYPE_S;
+	});
+
+	// Compute initial temperature sum
+	for(ulong n=0; n<lbm.get_N(); n++) {
+		initial_T_sum += (double)lbm.T[n];
+	}
+
+	// ####################################################################### run simulation, export images and data ##########################################################################
+	lbm.graphics.visualization_modes = VIS_FLAG_LATTICE|VIS_FIELD;
+	lbm.graphics.field_mode = 2; // temperature field
+
+	const ulong report_interval = 500u;
+	const ulong total_steps = 20000u;
+
+	print_info("Spectral Thermal Mixing Benchmark Started");
+	print_info("Grid: " + to_string(Nx) + "x" + to_string(Ny) + "x" + to_string(Nz));
+	print_info("Thermal diffusivity alpha = " + to_string(alpha));
+	print_info("Initial T sum: " + to_string(initial_T_sum, 2));
+
+	for(ulong step=0; step<total_steps; step+=report_interval) {
+		lbm.run(report_interval);
+
+		// Compute current temperature sum (should be conserved)
+		lbm.T.read_from_device();
+		double T_sum = 0.0;
+		double T_min = 1e10, T_max = -1e10;
+		for(ulong n=0; n<lbm.get_N(); n++) {
+			const double T = (double)lbm.T[n];
+			T_sum += T;
+			T_min = fmin(T_min, T);
+			T_max = fmax(T_max, T);
+		}
+
+		const double energy_error = (T_sum - initial_T_sum) / initial_T_sum * 100.0;
+		print_info("t=" + to_string(lbm.get_t()) + " T_range=[" + to_string(T_min, 3) + "," + to_string(T_max, 3) + "]" +
+		           " energy_error=" + to_string(energy_error, 6) + "%");
+	}
+
+	print_info("Spectral Thermal Mixing Benchmark Complete");
+} /**/
