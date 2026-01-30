@@ -36,6 +36,16 @@ private:
 	Memory<float>* buffer_complex = nullptr; // [N_complex * 2] for complex k-space data
 	Memory<float>* reduction_buffer = nullptr; // For parallel reduction (sum/mean)
 
+#ifdef SPECTRAL_SUBGRID
+	// Velocity FFT buffers (reuse buffer_complex for one component)
+	Memory<float>* ux_hat = nullptr;  // [N_complex * 2] FFT of ux
+	Memory<float>* uy_hat = nullptr;  // [N_complex * 2] FFT of uy
+	// uz_hat uses buffer_complex
+	Memory<float>* temp_complex = nullptr; // [N_complex * 2] temp for S_ij computation
+	Memory<float>* S_sq_accum = nullptr;   // [N] accumulator for |S|^2 in physical space
+	float Cs_delta_sq = SPECTRAL_CS_DELTA_SQ; // Smagorinsky (C_s * delta)^2
+#endif
+
 	// Pre-computed wavenumber arrays
 	Memory<float>* kx = nullptr;       // [Nx/2+1] wavenumbers in x
 	Memory<float>* ky = nullptr;       // [Ny] wavenumbers in y (FFT-ordered)
@@ -53,7 +63,11 @@ private:
 	float compute_field_sum(Memory<float>& field); // Returns sum of all elements in field
 
 #ifdef SPECTRAL_SUBGRID
-	Kernel kernel_strain_magnitude;  // Compute |S| from velocity in k-space
+	Kernel kernel_extract_velocity;   // Extract velocity component from AoS
+	Kernel kernel_compute_Sij;        // Compute strain component in k-space
+	Kernel kernel_accumulate_S_sq;    // Square S_ij and accumulate to |S|^2
+	Kernel kernel_compute_nu_t;       // Compute nu_t = (Cs*delta)^2 * sqrt(|S|^2)
+	Kernel kernel_zero_field;         // Zero a field
 #endif
 
 #ifdef SPECTRAL_TEMPERATURE
@@ -88,6 +102,12 @@ public:
 	void enqueue_forward_r2c(Memory<float>& field_in);   // real field -> buffer_complex
 	void enqueue_inverse_c2r(Memory<float>& field_out);  // buffer_complex -> real field
 
+#ifdef SPECTRAL_SUBGRID
+	// Helper FFT operations for SUBGRID (custom input/output buffers)
+	void enqueue_forward_r2c_to(Memory<float>& field_in, Memory<float>& complex_out);
+	void enqueue_inverse_c2r_from(Memory<float>& complex_in, Memory<float>& field_out);
+#endif
+
 	// High-level spectral operations for SURFACE
 #ifdef SPECTRAL_SURFACE
 	void enqueue_smooth_phi(Memory<float>& phi, const ulong timestep);
@@ -110,6 +130,10 @@ public:
 	void set_helmholtz_alpha(const float alpha) { helmholtz_alpha = alpha; }
 	uint get_smooth_cadence() const { return smooth_cadence; }
 	float get_helmholtz_alpha() const { return helmholtz_alpha; }
+#ifdef SPECTRAL_SUBGRID
+	void set_Cs_delta_sq(const float val) { Cs_delta_sq = val; }
+	float get_Cs_delta_sq() const { return Cs_delta_sq; }
+#endif
 	void finish_queue();
 
 	// For device_defines() integration - returns OpenCL preprocessor defines

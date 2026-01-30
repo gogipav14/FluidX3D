@@ -140,3 +140,6 @@
 #ifndef SPECTRAL_HELMHOLTZ_ALPHA
 #define SPECTRAL_HELMHOLTZ_ALPHA 1.0f // Helmholtz smoothing parameter
 #endif
+#ifndef SPECTRAL_CS_DELTA_SQ
+#define SPECTRAL_CS_DELTA_SQ 0.01f // Smagorinsky (C_s * delta)^2, default C_s=0.1, delta=1
+#endif

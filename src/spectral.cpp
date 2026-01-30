@@ -43,6 +43,13 @@ SpectralOps::~SpectralOps() {
 	delete ky;
 	delete kz;
 	delete k_mag_sq;
+
+#ifdef SPECTRAL_SUBGRID
+	delete ux_hat;
+	delete uy_hat;
+	delete temp_complex;
+	delete S_sq_accum;
+#endif
 }
 
 // Move constructor
@@ -122,6 +129,19 @@ void SpectralOps::allocate_buffers() {
 
 	// Pre-computed |k|^2 for all k-space points
 	k_mag_sq = new Memory<float>(*device, N_complex, 1u, true, true, 0.0f, false);
+
+#ifdef SPECTRAL_SUBGRID
+	// Velocity FFT buffers: store all 3 components in k-space simultaneously
+	ux_hat = new Memory<float>(*device, N_complex, 2u, false, true, 0.0f, false);
+	uy_hat = new Memory<float>(*device, N_complex, 2u, false, true, 0.0f, false);
+	// uz_hat reuses buffer_complex
+
+	// Temp complex buffer for S_ij computation
+	temp_complex = new Memory<float>(*device, N_complex, 2u, false, true, 0.0f, false);
+
+	// Accumulator for |S|^2 in physical space
+	S_sq_accum = new Memory<float>(*device, N, 1u, false, true, 0.0f, false);
+#endif
 }
 
 void SpectralOps::compute_wavenumbers() {
@@ -239,11 +259,28 @@ void SpectralOps::create_kernels() {
 	                           *buffer_real, *reduction_buffer, N);
 
 #ifdef SPECTRAL_SUBGRID
-	// Strain magnitude kernel - computes |S| from velocity in k-space
-	kernel_strain_magnitude = Kernel(*device, N_complex, "spectral_strain_magnitude",
-	                                 *buffer_complex, *buffer_complex, *buffer_complex, // ux, uy, uz hats (placeholders)
-	                                 *buffer_complex, // output: |S|_hat
-	                                 *kx, *ky, *kz);
+	// Extract velocity component: u[n*3 + dim] -> buffer_real[n]
+	kernel_extract_velocity = Kernel(*device, N, "spectral_extract_velocity",
+	                                 *buffer_real, *buffer_real, 0u); // u, buffer_real, dimension placeholder
+
+	// Compute S_ij in k-space from velocity FFTs
+	// component: 0=Sxx, 1=Syy, 2=Szz, 3=Sxy, 4=Sxz, 5=Syz
+	kernel_compute_Sij = Kernel(*device, N_complex, "spectral_compute_Sij",
+	                            *ux_hat, *uy_hat, *buffer_complex, // ux_hat, uy_hat, uz_hat
+	                            *temp_complex, // output S_ij in k-space
+	                            *kx, *ky, *kz, 0u); // wavenumbers, component
+
+	// Accumulate |S_ij|^2 to accumulator (after IFFT)
+	// factor is 1.0 for diagonal (Sxx, Syy, Szz) and 2.0 for off-diagonal (Sxy, Sxz, Syz)
+	kernel_accumulate_S_sq = Kernel(*device, N, "spectral_accumulate_S_sq",
+	                                *buffer_real, *S_sq_accum, 1.0f); // S_ij, accumulator, factor
+
+	// Compute nu_t = (Cs*delta)^2 * sqrt(2 * |S|^2)
+	kernel_compute_nu_t = Kernel(*device, N, "spectral_compute_nu_t",
+	                             *S_sq_accum, *buffer_real, Cs_delta_sq); // S_sq_accum, nu_t, Cs_delta_sq
+
+	// Zero a field
+	kernel_zero_field = Kernel(*device, N, "spectral_zero_field", *S_sq_accum);
 #endif
 
 #ifdef SPECTRAL_TEMPERATURE
@@ -344,16 +381,98 @@ void SpectralOps::enqueue_smooth_phi(Memory<float>& phi, const ulong timestep) {
 void SpectralOps::enqueue_compute_eddy_viscosity(Memory<float>& u, Memory<float>& nu_t) {
 	if (!plans_initialized) return;
 
-	// TODO: Implement spectral strain magnitude computation
-	// This requires:
-	// 1. FFT each velocity component (ux, uy, uz)
-	// 2. Compute strain rate tensor S_ij in k-space
-	// 3. Compute |S| = sqrt(2 * S_ij * S_ij)
-	// 4. IFFT |S| to physical space
-	// 5. Compute nu_t = (C_s * delta)^2 * |S|
+	// Step 1: Zero the |S|^2 accumulator
+	kernel_zero_field.set_parameters(0, *S_sq_accum).enqueue_run();
 
-	// For now, this is a placeholder
-	print_warning("SPECTRAL_SUBGRID: enqueue_compute_eddy_viscosity not yet fully implemented");
+	// Step 2: FFT all 3 velocity components
+	// Extract ux (dimension 0) -> buffer_real, then FFT -> ux_hat
+	kernel_extract_velocity.set_parameters(0, u, *buffer_real, 0u).enqueue_run();
+	enqueue_forward_r2c_to(*buffer_real, *ux_hat);
+
+	// Extract uy (dimension 1) -> buffer_real, then FFT -> uy_hat
+	kernel_extract_velocity.set_parameters(0, u, *buffer_real, 1u).enqueue_run();
+	enqueue_forward_r2c_to(*buffer_real, *uy_hat);
+
+	// Extract uz (dimension 2) -> buffer_real, then FFT -> buffer_complex (uz_hat)
+	kernel_extract_velocity.set_parameters(0, u, *buffer_real, 2u).enqueue_run();
+	enqueue_forward_r2c(*buffer_real); // Result in buffer_complex
+
+	// Step 3: Compute each strain component, IFFT, and accumulate |S|^2
+	// Strain components: 0=Sxx, 1=Syy, 2=Szz (diagonal, factor=1)
+	//                    3=Sxy, 4=Sxz, 5=Syz (off-diagonal, factor=2)
+
+	// Sxx = dux/dx
+	kernel_compute_Sij.set_parameters(0, *ux_hat, *uy_hat, *buffer_complex, *temp_complex,
+	                                  *kx, *ky, *kz, 0u).enqueue_run();
+	enqueue_inverse_c2r_from(*temp_complex, *buffer_real);
+	kernel_accumulate_S_sq.set_parameters(0, *buffer_real, *S_sq_accum, 1.0f).enqueue_run();
+
+	// Syy = duy/dy
+	kernel_compute_Sij.set_parameters(7, 1u).enqueue_run(); // Just change component
+	enqueue_inverse_c2r_from(*temp_complex, *buffer_real);
+	kernel_accumulate_S_sq.enqueue_run();
+
+	// Szz = duz/dz
+	kernel_compute_Sij.set_parameters(7, 2u).enqueue_run();
+	enqueue_inverse_c2r_from(*temp_complex, *buffer_real);
+	kernel_accumulate_S_sq.enqueue_run();
+
+	// Sxy = 0.5*(dux/dy + duy/dx), off-diagonal: factor=2
+	kernel_compute_Sij.set_parameters(7, 3u).enqueue_run();
+	enqueue_inverse_c2r_from(*temp_complex, *buffer_real);
+	kernel_accumulate_S_sq.set_parameters(2, 2.0f).enqueue_run();
+
+	// Sxz = 0.5*(dux/dz + duz/dx)
+	kernel_compute_Sij.set_parameters(7, 4u).enqueue_run();
+	enqueue_inverse_c2r_from(*temp_complex, *buffer_real);
+	kernel_accumulate_S_sq.enqueue_run();
+
+	// Syz = 0.5*(duy/dz + duz/dy)
+	kernel_compute_Sij.set_parameters(7, 5u).enqueue_run();
+	enqueue_inverse_c2r_from(*temp_complex, *buffer_real);
+	kernel_accumulate_S_sq.enqueue_run();
+
+	// Step 4: Compute nu_t = (Cs*delta)^2 * sqrt(2 * |S|^2)
+	kernel_compute_nu_t.set_parameters(0, *S_sq_accum, nu_t, Cs_delta_sq).enqueue_run();
+}
+
+// Helper: forward FFT to specific output buffer
+void SpectralOps::enqueue_forward_r2c_to(Memory<float>& field_in, Memory<float>& complex_out) {
+	if (!plans_initialized) return;
+
+	VkFFTLaunchParams params = {};
+	params.commandQueue = &cl_queue_handle;
+
+	cl_mem input_buf = field_in.get_cl_buffer()();
+	cl_mem output_buf = complex_out.get_cl_buffer()();
+	params.inputBuffer = &input_buf;
+	params.buffer = &output_buf;
+
+	VkFFTResult result = VkFFTAppend(&app_r2c, -1, &params);
+	if (result != VKFFT_SUCCESS) {
+		print_error("VkFFT forward R2C failed with error " + to_string((int)result));
+	}
+}
+
+// Helper: inverse FFT from specific input buffer
+void SpectralOps::enqueue_inverse_c2r_from(Memory<float>& complex_in, Memory<float>& field_out) {
+	if (!plans_initialized) return;
+
+	VkFFTLaunchParams params = {};
+	params.commandQueue = &cl_queue_handle;
+
+	cl_mem input_buf = complex_in.get_cl_buffer()();
+	cl_mem output_buf = field_out.get_cl_buffer()();
+	params.buffer = &input_buf;
+	params.outputBuffer = &output_buf;
+
+	VkFFTResult result = VkFFTAppend(&app_c2r, 1, &params);
+	if (result != VKFFT_SUCCESS) {
+		print_error("VkFFT inverse C2R failed with error " + to_string((int)result));
+	}
+
+	// Normalize
+	kernel_normalize.set_parameters(0, field_out, 1.0f / (float)N).enqueue_run();
 }
 #endif
 
@@ -489,18 +608,35 @@ kernel void spectral_reduce_sum(
 }
 
 #ifdef SPECTRAL_SUBGRID
-// Compute strain rate magnitude |S| from velocity in k-space
-// S_ij = 0.5 * (du_i/dx_j + du_j/dx_i)
-// |S| = sqrt(2 * S_ij * S_ij)
-// Note: This outputs |S|^2 in k-space, not |S| directly
-kernel void spectral_strain_magnitude(
-	const global float* ux_hat,       // [N_complex * 2] velocity x component in k-space
-	const global float* uy_hat,       // [N_complex * 2] velocity y component
-	const global float* uz_hat,       // [N_complex * 2] velocity z component
-	global float* S_mag_sq_hat,       // [N_complex * 2] output: |S|^2 in k-space
+// Extract one velocity component from AoS format: u[n*3 + dim] -> out[n]
+kernel void spectral_extract_velocity(
+	const global float* u,            // [N * 3] velocity in AoS format
+	global float* out,                // [N] extracted component
+	const uint dimension              // 0=x, 1=y, 2=z
+) {
+	const ulong n = get_global_id(0);
+	if (n >= def_spectral_N) return;
+	out[n] = u[n * 3ul + (ulong)dimension];
+}
+
+// Zero a field
+kernel void spectral_zero_field(global float* field) {
+	const ulong idx = get_global_id(0);
+	if (idx >= def_spectral_N) return;
+	field[idx] = 0.0f;
+}
+
+// Compute strain component S_ij in k-space
+// component: 0=Sxx, 1=Syy, 2=Szz, 3=Sxy, 4=Sxz, 5=Syz
+kernel void spectral_compute_Sij(
+	const global float* ux_hat,       // [N_complex * 2] velocity x in k-space
+	const global float* uy_hat,       // [N_complex * 2] velocity y in k-space
+	const global float* uz_hat,       // [N_complex * 2] velocity z in k-space
+	global float* Sij_hat,            // [N_complex * 2] output: S_ij in k-space
 	const global float* kx,           // [Nx/2+1] wavenumbers
 	const global float* ky,           // [Ny] wavenumbers (FFT-ordered)
-	const global float* kz            // [Nz] wavenumbers (FFT-ordered)
+	const global float* kz,           // [Nz] wavenumbers (FFT-ordered)
+	const uint component              // which strain component
 ) {
 	const ulong idx = get_global_id(0);
 	if (idx >= def_spectral_N_complex) return;
@@ -514,56 +650,75 @@ kernel void spectral_strain_magnitude(
 	const float ky_val = ky[j];
 	const float kz_val = kz[k];
 
-	// Load velocity components (complex)
+	// Load velocity components
 	const float ux_re = ux_hat[2*idx], ux_im = ux_hat[2*idx + 1];
 	const float uy_re = uy_hat[2*idx], uy_im = uy_hat[2*idx + 1];
 	const float uz_re = uz_hat[2*idx], uz_im = uz_hat[2*idx + 1];
 
-	// Compute velocity gradients in k-space: d/dx_j -> i*k_j
-	// du_i/dx_j = i*k_j * u_i_hat  (complex multiplication by i*k)
+	// Spectral derivative: d/dx -> i*kx multiplies complex number
 	// (a + bi) * (i*k) = -b*k + a*k*i
+	float Sij_re = 0.0f, Sij_im = 0.0f;
 
-	// dux/dx, dux/dy, dux/dz
-	const float duxdx_re = -ux_im * kx_val, duxdx_im = ux_re * kx_val;
-	const float duxdy_re = -ux_im * ky_val, duxdy_im = ux_re * ky_val;
-	const float duxdz_re = -ux_im * kz_val, duxdz_im = ux_re * kz_val;
+	switch (component) {
+		case 0: // Sxx = dux/dx
+			Sij_re = -ux_im * kx_val;
+			Sij_im =  ux_re * kx_val;
+			break;
+		case 1: // Syy = duy/dy
+			Sij_re = -uy_im * ky_val;
+			Sij_im =  uy_re * ky_val;
+			break;
+		case 2: // Szz = duz/dz
+			Sij_re = -uz_im * kz_val;
+			Sij_im =  uz_re * kz_val;
+			break;
+		case 3: // Sxy = 0.5*(dux/dy + duy/dx)
+			Sij_re = 0.5f * (-ux_im * ky_val - uy_im * kx_val);
+			Sij_im = 0.5f * ( ux_re * ky_val + uy_re * kx_val);
+			break;
+		case 4: // Sxz = 0.5*(dux/dz + duz/dx)
+			Sij_re = 0.5f * (-ux_im * kz_val - uz_im * kx_val);
+			Sij_im = 0.5f * ( ux_re * kz_val + uz_re * kx_val);
+			break;
+		case 5: // Syz = 0.5*(duy/dz + duz/dy)
+			Sij_re = 0.5f * (-uy_im * kz_val - uz_im * ky_val);
+			Sij_im = 0.5f * ( uy_re * kz_val + uz_re * ky_val);
+			break;
+	}
 
-	// duy/dx, duy/dy, duy/dz
-	const float duydx_re = -uy_im * kx_val, duydx_im = uy_re * kx_val;
-	const float duydy_re = -uy_im * ky_val, duydy_im = uy_re * ky_val;
-	const float duydz_re = -uy_im * kz_val, duydz_im = uy_re * kz_val;
+	Sij_hat[2*idx    ] = Sij_re;
+	Sij_hat[2*idx + 1] = Sij_im;
+}
 
-	// duz/dx, duz/dy, duz/dz
-	const float duzdx_re = -uz_im * kx_val, duzdx_im = uz_re * kx_val;
-	const float duzdy_re = -uz_im * ky_val, duzdy_im = uz_re * ky_val;
-	const float duzdz_re = -uz_im * kz_val, duzdz_im = uz_re * kz_val;
+// Accumulate |S_ij|^2 to accumulator: accum += factor * S_ij^2
+kernel void spectral_accumulate_S_sq(
+	const global float* Sij,          // [N] S_ij component in physical space
+	global float* accum,              // [N] accumulator for |S|^2
+	const float factor                // 1.0 for diagonal, 2.0 for off-diagonal
+) {
+	const ulong idx = get_global_id(0);
+	if (idx >= def_spectral_N) return;
+	const float s = Sij[idx];
+	accum[idx] += factor * s * s;
+}
 
-	// Strain rate tensor (symmetric): S_ij = 0.5 * (du_i/dx_j + du_j/dx_i)
-	// S_xx = dux/dx, S_yy = duy/dy, S_zz = duz/dz
-	// S_xy = 0.5*(dux/dy + duy/dx), S_xz = 0.5*(dux/dz + duz/dx), S_yz = 0.5*(duy/dz + duz/dy)
-
-	const float Sxx_re = duxdx_re, Sxx_im = duxdx_im;
-	const float Syy_re = duydy_re, Syy_im = duydy_im;
-	const float Szz_re = duzdz_re, Szz_im = duzdz_im;
-
-	const float Sxy_re = 0.5f * (duxdy_re + duydx_re), Sxy_im = 0.5f * (duxdy_im + duydx_im);
-	const float Sxz_re = 0.5f * (duxdz_re + duzdx_re), Sxz_im = 0.5f * (duxdz_im + duzdx_im);
-	const float Syz_re = 0.5f * (duydz_re + duzdy_re), Syz_im = 0.5f * (duydz_im + duzdy_im);
-
-	// |S|^2 = 2 * S_ij * S_ij = 2 * (S_xx^2 + S_yy^2 + S_zz^2 + 2*S_xy^2 + 2*S_xz^2 + 2*S_yz^2)
-	// For complex: |z|^2 = re^2 + im^2
-	const float S_mag_sq = 2.0f * (
-		(Sxx_re*Sxx_re + Sxx_im*Sxx_im) +
-		(Syy_re*Syy_re + Syy_im*Syy_im) +
-		(Szz_re*Szz_re + Szz_im*Szz_im) +
-		2.0f * (Sxy_re*Sxy_re + Sxy_im*Sxy_im) +
-		2.0f * (Sxz_re*Sxz_re + Sxz_im*Sxz_im) +
-		2.0f * (Syz_re*Syz_re + Syz_im*Syz_im)
-	);
-
-	// Store as "complex" with imaginary part = 0 (real result)
-	S_mag_sq_hat[2*idx    ] = S_mag_sq;
-	S_mag_sq_hat[2*idx + 1] = 0.0f;
+// Compute eddy viscosity: nu_t = Cs_delta_sq * sqrt(2 * |S|^2)
+kernel void spectral_compute_nu_t(
+	const global float* S_sq_accum,   // [N] accumulated |S|^2
+	global float* nu_t,               // [N] output eddy viscosity
+	const float Cs_delta_sq           // (C_s * delta)^2
+) {
+	const ulong idx = get_global_id(0);
+	if (idx >= def_spectral_N) return;
+	// |S| = sqrt(2 * S_ij * S_ij), and we accumulated S_ij^2 with proper factors
+	// So |S|^2 = 2 * sum(factor_ij * S_ij^2) where factor=1 for diag, 2 for off-diag
+	// But we already included the factor 2 in accumulation formula
+	// Actually, |S|^2 = 2*(Sxx^2 + Syy^2 + Szz^2 + 2*Sxy^2 + 2*Sxz^2 + 2*Syz^2)
+	// We accumulated with factor=1 for diag and factor=2 for off-diag
+	// So accum = Sxx^2 + Syy^2 + Szz^2 + 2*Sxy^2 + 2*Sxz^2 + 2*Syz^2
+	// |S| = sqrt(2 * accum)
+	const float S_mag = sqrt(2.0f * S_sq_accum[idx]);
+	nu_t[idx] = Cs_delta_sq * S_mag;
 }
 #endif // SPECTRAL_SUBGRID
 
