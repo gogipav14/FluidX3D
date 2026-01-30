@@ -34,6 +34,7 @@ private:
 	// Work buffers
 	Memory<float>* buffer_real = nullptr;    // [N] temp buffer for real field
 	Memory<float>* buffer_complex = nullptr; // [N_complex * 2] for complex k-space data
+	Memory<float>* reduction_buffer = nullptr; // For parallel reduction (sum/mean)
 
 	// Pre-computed wavenumber arrays
 	Memory<float>* kx = nullptr;       // [Nx/2+1] wavenumbers in x
@@ -46,7 +47,10 @@ private:
 	Kernel kernel_lowpass;           // Low-pass filter: exp(-k^2/(2*k_c^2))
 	Kernel kernel_normalize;         // Normalize after IFFT: field /= N
 	Kernel kernel_mass_correction;   // Subtract mean delta from field
-	Kernel kernel_compute_mean;      // Compute mean of field (reduction)
+	Kernel kernel_reduce_sum;        // Parallel sum reduction
+
+	// Reduction helper
+	float compute_field_sum(Memory<float>& field); // Returns sum of all elements in field
 
 #ifdef SPECTRAL_SUBGRID
 	Kernel kernel_strain_magnitude;  // Compute |S| from velocity in k-space

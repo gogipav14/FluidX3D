@@ -38,6 +38,7 @@ SpectralOps::~SpectralOps() {
 
 	delete buffer_real;
 	delete buffer_complex;
+	delete reduction_buffer;
 	delete kx;
 	delete ky;
 	delete kz;
@@ -55,6 +56,7 @@ SpectralOps& SpectralOps::operator=(SpectralOps&& other) noexcept {
 		destroy_fft_plans();
 		delete buffer_real;
 		delete buffer_complex;
+		delete reduction_buffer;
 		delete kx;
 		delete ky;
 		delete kz;
@@ -74,6 +76,7 @@ SpectralOps& SpectralOps::operator=(SpectralOps&& other) noexcept {
 		plans_initialized = other.plans_initialized;
 		buffer_real = other.buffer_real;
 		buffer_complex = other.buffer_complex;
+		reduction_buffer = other.reduction_buffer;
 		kx = other.kx;
 		ky = other.ky;
 		kz = other.kz;
@@ -86,11 +89,12 @@ SpectralOps& SpectralOps::operator=(SpectralOps&& other) noexcept {
 		kernel_lowpass = other.kernel_lowpass;
 		kernel_normalize = other.kernel_normalize;
 		kernel_mass_correction = other.kernel_mass_correction;
-		kernel_compute_mean = other.kernel_compute_mean;
+		kernel_reduce_sum = other.kernel_reduce_sum;
 
 		// Null out other's pointers to prevent double-free
 		other.buffer_real = nullptr;
 		other.buffer_complex = nullptr;
+		other.reduction_buffer = nullptr;
 		other.kx = nullptr;
 		other.ky = nullptr;
 		other.kz = nullptr;
@@ -106,6 +110,10 @@ void SpectralOps::allocate_buffers() {
 
 	// Complex buffer: (Nx/2+1) * Ny * Nz complex values = 2 floats each
 	buffer_complex = new Memory<float>(*device, N_complex, 2u, false, true, 0.0f, false); // device only
+
+	// Reduction buffer for parallel sum (256 work groups max)
+	const ulong reduction_size = 256ull;
+	reduction_buffer = new Memory<float>(*device, reduction_size, 1u, true, true, 0.0f, false);
 
 	// Wavenumber arrays
 	kx = new Memory<float>(*device, Nx/2 + 1, 1u, true, true, 0.0f, false);
@@ -226,6 +234,10 @@ void SpectralOps::create_kernels() {
 	kernel_mass_correction = Kernel(*device, N, "spectral_mass_correction",
 	                                *buffer_real, 0.0f); // delta_mean placeholder
 
+	// Reduction kernel for computing sum
+	kernel_reduce_sum = Kernel(*device, 256ull, "spectral_reduce_sum",
+	                           *buffer_real, *reduction_buffer, N);
+
 #ifdef SPECTRAL_SUBGRID
 	// Strain magnitude kernel - computes |S| from velocity in k-space
 	kernel_strain_magnitude = Kernel(*device, N_complex, "spectral_strain_magnitude",
@@ -278,26 +290,53 @@ void SpectralOps::enqueue_inverse_c2r(Memory<float>& field_out) {
 	kernel_normalize.set_parameters(0, field_out, 1.0f / (float)N).enqueue_run();
 }
 
+float SpectralOps::compute_field_sum(Memory<float>& field) {
+	// Run parallel reduction kernel
+	kernel_reduce_sum.set_parameters(0, field, *reduction_buffer, N).enqueue_run();
+
+	// Read back partial sums (256 values)
+	reduction_buffer->read_from_device();
+
+	// Sum on CPU (small array, fast)
+	float total = 0.0f;
+	const ulong num_groups = 256ull;
+	for (ulong i = 0; i < num_groups; i++) {
+		total += reduction_buffer->data()[i];
+	}
+	return total;
+}
+
 #ifdef SPECTRAL_SURFACE
 void SpectralOps::enqueue_smooth_phi(Memory<float>& phi, const ulong timestep) {
 	// Only smooth every smooth_cadence steps
 	if (timestep % smooth_cadence != 0) return;
 	if (!plans_initialized) return;
 
-	// TODO: For mass conservation, compute mean before and after
-	// For now, just apply Helmholtz smoothing
+	// Step 1: Compute sum(phi) before smoothing (for mass conservation)
+	const float sum_before = compute_field_sum(phi);
+	const float mean_before = sum_before / (float)N;
 
-	// Forward FFT: phi -> phi_hat (in buffer_complex)
+	// Step 2: Forward FFT: phi -> phi_hat (in buffer_complex)
 	enqueue_forward_r2c(phi);
 
-	// Apply Helmholtz filter in k-space: phi_hat *= 1/(1 + alpha*k^2)
+	// Step 3: Apply Helmholtz filter in k-space: phi_hat *= 1/(1 + alpha*k^2)
+	// Note: H(0) = 1, so mean is preserved in exact arithmetic
+	// But numerical errors can accumulate, so we correct explicitly
 	kernel_helmholtz.set_parameters(2, helmholtz_alpha).enqueue_run();
 
-	// Inverse FFT: phi_hat -> phi
+	// Step 4: Inverse FFT: phi_hat -> phi
 	enqueue_inverse_c2r(phi);
 
-	// Note: Mass correction should be added here for strict conservation
-	// This requires computing mean(phi) before and after, which needs a reduction
+	// Step 5: Compute sum(phi) after smoothing
+	const float sum_after = compute_field_sum(phi);
+	const float mean_after = sum_after / (float)N;
+
+	// Step 6: Apply mass correction: phi -= (mean_after - mean_before)
+	// This ensures sum(phi) is exactly preserved
+	const float delta_mean = mean_after - mean_before;
+	if (fabs(delta_mean) > 1e-10f) { // Only correct if there's a measurable difference
+		kernel_mass_correction.set_parameters(0, phi, delta_mean).enqueue_run();
+	}
 }
 #endif
 
@@ -404,6 +443,49 @@ kernel void spectral_mass_correction(
 	if (idx >= def_spectral_N) return;
 
 	field[idx] -= delta_mean;
+}
+
+// Parallel sum reduction: computes partial sums for 256 work groups
+// Each work group reduces a chunk of the input to a single value
+kernel void spectral_reduce_sum(
+	const global float* field,        // Input field to sum
+	global float* partial_sums,       // Output: 256 partial sums
+	const ulong field_size            // Size of input field
+) {
+	const uint group_id = get_group_id(0);
+	const uint local_id = get_local_id(0);
+	const uint local_size = get_local_size(0);
+	const uint num_groups = get_num_groups(0);
+
+	// Each work group handles a chunk of the input
+	const ulong chunk_size = (field_size + num_groups - 1) / num_groups;
+	const ulong start = (ulong)group_id * chunk_size;
+	const ulong end = min(start + chunk_size, field_size);
+
+	// Local memory for reduction within work group
+	local float local_sum[256];
+
+	// Each work item accumulates its portion
+	float sum = 0.0f;
+	for (ulong i = start + local_id; i < end; i += local_size) {
+		sum += field[i];
+	}
+	local_sum[local_id] = sum;
+
+	barrier(CLK_LOCAL_MEM_FENCE);
+
+	// Tree reduction within work group
+	for (uint stride = local_size / 2; stride > 0; stride /= 2) {
+		if (local_id < stride) {
+			local_sum[local_id] += local_sum[local_id + stride];
+		}
+		barrier(CLK_LOCAL_MEM_FENCE);
+	}
+
+	// First work item writes result
+	if (local_id == 0) {
+		partial_sums[group_id] = local_sum[0];
+	}
 }
 
 #ifdef SPECTRAL_SUBGRID
