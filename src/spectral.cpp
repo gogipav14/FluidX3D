@@ -68,6 +68,12 @@ SpectralOps& SpectralOps::operator=(SpectralOps&& other) noexcept {
 		delete ky;
 		delete kz;
 		delete k_mag_sq;
+#ifdef SPECTRAL_SUBGRID
+		delete ux_hat;
+		delete uy_hat;
+		delete temp_complex;
+		delete S_sq_accum;
+#endif
 
 		device = other.device;
 		Nx = other.Nx;
@@ -97,6 +103,27 @@ SpectralOps& SpectralOps::operator=(SpectralOps&& other) noexcept {
 		kernel_normalize = other.kernel_normalize;
 		kernel_mass_correction = other.kernel_mass_correction;
 		kernel_reduce_sum = other.kernel_reduce_sum;
+
+#ifdef SPECTRAL_SUBGRID
+		ux_hat = other.ux_hat;
+		uy_hat = other.uy_hat;
+		temp_complex = other.temp_complex;
+		S_sq_accum = other.S_sq_accum;
+		Cs_delta_sq = other.Cs_delta_sq;
+		kernel_extract_velocity = other.kernel_extract_velocity;
+		kernel_compute_Sij = other.kernel_compute_Sij;
+		kernel_accumulate_S_sq = other.kernel_accumulate_S_sq;
+		kernel_compute_nu_t = other.kernel_compute_nu_t;
+		kernel_zero_field = other.kernel_zero_field;
+		other.ux_hat = nullptr;
+		other.uy_hat = nullptr;
+		other.temp_complex = nullptr;
+		other.S_sq_accum = nullptr;
+#endif
+
+#ifdef SPECTRAL_TEMPERATURE
+		kernel_diffusion_etd = other.kernel_diffusion_etd;
+#endif
 
 		// Null out other's pointers to prevent double-free
 		other.buffer_real = nullptr;

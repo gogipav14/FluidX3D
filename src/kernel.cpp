@@ -1477,6 +1477,9 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+"#ifdef TEMPERATURE"+R(
 	, global fpxx* gi, global float* T // argument order is important
 )+"#endif"+R( // TEMPERATURE
+)+"#ifdef SPECTRAL_SUBGRID"+R(
+	, const global float* nu_t // spectral eddy viscosity
+)+"#endif"+R( // SPECTRAL_SUBGRID
 )+") {"+R( // stream_collide()
 	const uxx n = get_global_id(0); // n = x+(y+z*Ny)*Nx
 	if(n>=(uxx)def_N||is_halo(n)) return; // don't execute stream_collide() on halo
@@ -1595,6 +1598,13 @@ string opencl_c_container() { return R( // ########################## begin of O
 	float w = def_w; // LBM relaxation rate w = dt/tau = dt/(nu/c^2+dt/2) = 1/(3*nu+1/2)
 
 )+"#ifdef SUBGRID"+R(
+)+"#ifdef SPECTRAL_SUBGRID"+R(
+	{ // Use spectrally-computed eddy viscosity nu_t
+		const float tau0 = 1.0f/w;
+		const float nu_turb = nu_t[n]; // read spectral eddy viscosity
+		w = 1.0f/(tau0 + 3.0f*nu_turb); // tau_eff = tau0 + 3*nu_t, since tau = 3*nu + 0.5
+	} // modify LBM relaxation rate using spectral eddy viscosity, nu_eff = nu_0+nu_t
+)+"#else"+R( // !SPECTRAL_SUBGRID
 	{ // Smagorinsky-Lilly subgrid turbulence model, source: https://arxiv.org/pdf/comp-gas/9401004.pdf, in the eq. below (26), it is "tau_0" not "nu_0", and "sqrt(2)/rho" (they call "rho" "n") is missing
 		const float tau0 = 1.0f/w; // source 2: https://youtu.be/V8ydRrdCzl0
 		float Hxx=0.0f, Hyy=0.0f, Hzz=0.0f, Hxy=0.0f, Hxz=0.0f, Hyz=0.0f; // non-equilibrium stress tensor
@@ -1607,7 +1617,8 @@ string opencl_c_container() { return R( // ########################## begin of O
 		}
 		const float Q = sq(Hxx)+sq(Hyy)+sq(Hzz)+2.0f*(sq(Hxy)+sq(Hxz)+sq(Hyz)); // Q = H*H, turbulent eddy viscosity nut = (C*Delta)^2*|S|, intensity of local strain rate tensor |S|=sqrt(2*S*S)
 		w = 2.0f/(tau0+sqrt(sq(tau0)+0.76421222f*sqrt(Q)/rhon)); // 0.76421222 = 18*sqrt(2)*(C*Delta)^2, C = 1/pi*(2/(3*CK))^(3/4) = Smagorinsky-Lilly constant, CK = 3/2 = Kolmogorov constant, Delta = 1 = lattice constant
-	} // modity LBM relaxation rate by increasing effective viscosity in regions of high strain rate (add turbulent eddy viscosity), nu_eff = nu_0+nu_t
+	} // modify LBM relaxation rate by increasing effective viscosity in regions of high strain rate (add turbulent eddy viscosity), nu_eff = nu_0+nu_t
+)+"#endif"+R( // SPECTRAL_SUBGRID
 )+"#endif"+R( // SUBGRID
 
 )+"#if defined(SRT)"+R(

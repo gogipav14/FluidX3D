@@ -63,15 +63,20 @@ surface_3 updates phi -> spectral smooth phi -> communicate_phi_massex_flags
 compute nu_t spectrally -> stream_collide uses nu_t for modified relaxation
 ```
 
-**Kernel modification:** In `kernel.cpp:1597-1611`, replace inline Smagorinsky:
+**Kernel modification:** In `kernel.cpp:1600-1620`, spectral nu_t is used when SPECTRAL_SUBGRID enabled:
 ```cpp
 #ifdef SPECTRAL_SUBGRID
-const float nu_turb = nu_t[n];
-w = 2.0f / (tau0 + 6.0f * nu_turb);
+{ // Use spectrally-computed eddy viscosity nu_t
+    const float tau0 = 1.0f/w;
+    const float nu_turb = nu_t[n]; // read spectral eddy viscosity
+    w = 1.0f/(tau0 + 3.0f*nu_turb); // tau_eff = tau0 + 3*nu_t
+}
 #else
 // Original inline Smagorinsky from fneq
 #endif
 ```
+
+**Note:** The relationship is `tau = 3*nu + 0.5`, so `tau_eff = tau0 + 3*nu_t` for `nu_eff = nu_0 + nu_t`.
 
 ---
 

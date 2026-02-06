@@ -177,6 +177,7 @@ void LBM_Domain::allocate(Device& device) {
 		spectral = new SpectralOps(device, Nx, Ny, Nz);
 #ifdef SPECTRAL_SUBGRID
 		nu_t = Memory<float>(device, N, 1u, false, true, 0.0f, false); // device only, 4 bytes/cell
+		kernel_stream_collide.add_parameters(nu_t); // add nu_t to collision kernel
 #endif // SPECTRAL_SUBGRID
 	} else {
 		print_warning("Spectral operations disabled for multi-GPU mode");
