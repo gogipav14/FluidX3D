@@ -1,0 +1,34 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build FluidX3D",
+            "type": "shell",
+            "command": "./make.sh",
+            "args": [],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$gcc"],
+            "detail": "Compile and run FluidX3D"
+        },
+        {
+            "label": "Build Only (no run)",
+            "type": "shell",
+            "command": "make",
+            "args": ["Linux", "-j$(nproc)"],
+            "group": "build",
+            "problemMatcher": ["$gcc"],
+            "detail": "Compile without running"
+        },
+        {
+            "label": "Clean",
+            "type": "shell",
+            "command": "rm",
+            "args": ["-rf", "bin/FluidX3D", "temp"],
+            "group": "build",
+            "problemMatcher": []
+        }
+    ]
+}
