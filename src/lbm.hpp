@@ -15,7 +15,7 @@ string default_filename(const string& path, const string& name, const string& ex
 string default_filename(const string& name, const string& extension, const ulong t); // generate a default filename with timestamp at exe_path/export/
 
 #pragma warning(disable:26812)
-enum enum_transfer_field { fi, rho_u_flags, flags, F, phi_massex_flags, gi, T, enum_transfer_field_length };
+enum enum_transfer_field { fi, rho_u_flags, flags, F, phi_massex_flags, gi, T, ci, C, enum_transfer_field_length };
 
 class LBM_Domain {
 private:
@@ -59,6 +59,9 @@ private:
 #ifdef TEMPERATURE
 	Memory<fpxx> gi; // thermal DDFs
 #endif // TEMPERATURE
+#ifdef SCALAR
+	Memory<fpxx> ci; // scalar DDFs (D3Q7, passive scalar transport)
+#endif // SCALAR
 #ifdef PARTICLES
 	Kernel kernel_integrate_particles; // intgegrates particles forward in time and couples particles to fluid
 #endif // PARTICLES
@@ -80,6 +83,9 @@ public:
 #ifdef TEMPERATURE
 	Memory<float> T; // temperature of every cell
 #endif // TEMPERATURE
+#ifdef SCALAR
+	Memory<float> C; // scalar concentration of every cell
+#endif // SCALAR
 #ifdef PARTICLES
 	Memory<float> particles; // particle positions
 #endif // PARTICLES
@@ -231,6 +237,10 @@ private:
 	void communicate_gi();
 	void communicate_T();
 #endif // TEMPERATURE
+#ifdef SCALAR
+	void communicate_ci();
+	void communicate_C();
+#endif // SCALAR
 #ifdef PARTICLES
 	void communicate_particles();
 #endif // PARTICLES
@@ -421,6 +431,9 @@ public:
 #ifdef TEMPERATURE
 	Memory_Container<float> T; // temperature of every cell
 #endif // TEMPERATURE
+#ifdef SCALAR
+	Memory_Container<float> C; // scalar concentration of every cell
+#endif // SCALAR
 #ifdef PARTICLES
 	Memory<float>* particles; // particle positions
 #endif // PARTICLES

@@ -1364,3 +1364,31 @@ void main_setup() { // benchmark; required extensions in defines.hpp: BENCHMARK,
 	lbm.run();
 	//lbm.run(1000u); lbm.u.read_from_device(); println(lbm.u.x[lbm.index(Nx/2u, Ny/2u, Nz/2u)]); wait(); // test for binary identity
 } /**/
+
+
+
+void main_setup() { // Scalar advection-diffusion test; required extensions in defines.hpp: SCALAR
+	// Gaussian blob advected by uniform velocity with diffusion
+	// Tests SCALAR extension: D3Q7 passive scalar transport
+	const float D_scalar = 0.01f; // scalar diffusivity
+	const float nu = 0.1f; // kinematic viscosity (Sc = nu/D = 10)
+	LBM lbm(64u, 64u, 64u, nu, 0.0f, 0.0f, 0.0f, 0.0f, D_scalar); // alpha = D_scalar
+	const uint Nx=lbm.get_Nx(), Ny=lbm.get_Ny(), Nz=lbm.get_Nz();
+	const float ux0 = 0.05f; // uniform advection velocity in x
+	const float sigma = 8.0f; // Gaussian blob width
+	parallel_for(lbm.get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lbm.coordinates(n, x, y, z);
+		const float fx = (float)x+0.5f-0.5f*(float)Nx;
+		const float fy = (float)y+0.5f-0.5f*(float)Ny;
+		const float fz = (float)z+0.5f-0.5f*(float)Nz;
+		lbm.u.x[n] = ux0; // uniform velocity
+		lbm.u.y[n] = 0.0f;
+		lbm.u.z[n] = 0.0f;
+		lbm.C[n] = 1.0f + expf(-(fx*fx+fy*fy+fz*fz)/(2.0f*sigma*sigma)); // Gaussian blob centered, offset by 1.0 (perturbation method)
+	});
+	lbm.run(1000u);
+	// Read back and print concentration at center for verification
+	lbm.C.read_from_device();
+	const float C_center = lbm.C[lbm.index(Nx/2u, Ny/2u, Nz/2u)];
+	print_info("Scalar at center after 1000 steps: C = "+to_string(C_center, 8u));
+	print_info("Expected: blob diffused and advected, C_center < 2.0 (initial peak)");
+} /**/
