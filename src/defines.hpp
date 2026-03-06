@@ -21,6 +21,7 @@
 //#define MOVING_BOUNDARIES // enables moving solids: set solid cells to TYPE_S and set their velocity u unequal to zero
 //#define SURFACE // enables free surface LBM: mark fluid cells with TYPE_F; at initialization the TYPE_I interface and TYPE_G gas domains will automatically be completed; allocates an extra 12 Bytes/cell
 //#define TEMPERATURE // enables temperature extension; set fixed-temperature cells with TYPE_T (similar to EQUILIBRIUM_BOUNDARIES); allocates an extra 32 (FP32) or 18 (FP16) Bytes/cell
+#define SCALAR // enables passive scalar transport extension; set fixed-concentration cells with TYPE_C; allocates an extra 32 (FP32) or 18 (FP16) Bytes/cell; uses D3Q7 lattice with diffusivity D_scalar passed as alpha in LBM constructor
 //#define SUBGRID // enables Smagorinsky-Lilly subgrid turbulence LES model to keep simulations with very large Reynolds number stable
 //#define PARTICLES // enables particles with immersed-boundary method (for 2-way coupling also activate VOLUME_FORCE and FORCE_FIELD; only supported in single-GPU)
 
@@ -53,7 +54,8 @@
 #define TYPE_F 0b00001000 // fluid
 #define TYPE_I 0b00010000 // interface
 #define TYPE_G 0b00100000 // gas
-#define TYPE_X 0b01000000 // reserved type X
+#define TYPE_X 0b01000000 // reserved type X (used as TYPE_C for scalar boundary)
+#define TYPE_C TYPE_X // scalar concentration boundary
 #define TYPE_Y 0b10000000 // reserved type Y
 
 #define VIS_FLAG_LATTICE  0b00000001 // lbm.graphics.visualization_modes = VIS_...|VIS_...|VIS_...;
@@ -79,6 +81,7 @@
 #undef EQUILIBRIUM_BOUNDARIES
 #undef SURFACE
 #undef TEMPERATURE
+#undef SCALAR
 #undef SUBGRID
 #undef PARTICLES
 #undef INTERACTIVE_GRAPHICS

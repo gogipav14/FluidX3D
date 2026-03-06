@@ -1297,8 +1297,8 @@ string opencl_c_container() { return R( // ########################## begin of O
 }
 )+"#endif"+R( // SURFACE
 
-)+"#ifdef TEMPERATURE"+R(
-)+R(void neighbors_temperature(const uxx n, uxx* j7) { // calculate neighbor indices
+)+"#if defined(TEMPERATURE)||defined(SCALAR)"+R( // D3Q7 helper functions shared by TEMPERATURE and SCALAR
+)+R(void neighbors_d3q7(const uxx n, uxx* j7) { // calculate D3Q7 neighbor indices
 	uxx x0, xp, xm, y0, yp, ym, z0, zp, zm;
 	calculate_indices(n, &x0, &xp, &xm, &y0, &yp, &ym, &z0, &zp, &zm);
 	j7[0] = n;
@@ -1306,28 +1306,28 @@ string opencl_c_container() { return R( // ########################## begin of O
 	j7[3] = x0+yp+z0; j7[4] = x0+ym+z0; // 0+0 0-0
 	j7[5] = x0+y0+zp; j7[6] = x0+y0+zm; // 00+ 00-
 }
-)+R(void calculate_g_eq(const float T, const float ux, const float uy, const float uz, float* geq) { // calculate g_equilibrium from density and velocity field (perturbation method / DDF-shifting)
-	const float wsT4=0.5f*T, wsTm1=0.125f*(T-1.0f); // 0.125f*T*4.0f (straight directions in D3Q7), wsTm1 is arithmetic optimization to minimize digit extinction, lattice speed of sound is 1/2 for D3Q7 and not 1/sqrt(3)
-	geq[0] = fma(0.25f, T, -0.25f); // 000
-	geq[1] = fma(wsT4, ux, wsTm1); geq[2] = fma(wsT4, -ux, wsTm1); // +00 -00, source: http://dx.doi.org/10.1016/j.ijheatmasstransfer.2009.11.014
-	geq[3] = fma(wsT4, uy, wsTm1); geq[4] = fma(wsT4, -uy, wsTm1); // 0+0 0-0
-	geq[5] = fma(wsT4, uz, wsTm1); geq[6] = fma(wsT4, -uz, wsTm1); // 00+ 00-
+)+R(void calculate_d3q7_eq(const float phi, const float ux, const float uy, const float uz, float* heq) { // calculate D3Q7 equilibrium from scalar and velocity field (perturbation method / DDF-shifting)
+	const float ws4=0.5f*phi, wsm1=0.125f*(phi-1.0f); // 0.125f*phi*4.0f (straight directions in D3Q7), wsm1 is arithmetic optimization to minimize digit extinction, lattice speed of sound is 1/2 for D3Q7 and not 1/sqrt(3)
+	heq[0] = fma(0.25f, phi, -0.25f); // 000
+	heq[1] = fma(ws4, ux, wsm1); heq[2] = fma(ws4, -ux, wsm1); // +00 -00, source: http://dx.doi.org/10.1016/j.ijheatmasstransfer.2009.11.014
+	heq[3] = fma(ws4, uy, wsm1); heq[4] = fma(ws4, -uy, wsm1); // 0+0 0-0
+	heq[5] = fma(ws4, uz, wsm1); heq[6] = fma(ws4, -uz, wsm1); // 00+ 00-
 }
-)+R(void load_g(const uxx n, float* ghn, const global fpxx* gi, const uxx* j7, const ulong t) {
-	ghn[0] = load(gi, index_f(n, 0u)); // Esoteric-Pull
+)+R(void load_d3q7(const uxx n, float* hhn, const global fpxx* hi, const uxx* j7, const ulong t) {
+	hhn[0] = load(hi, index_f(n, 0u)); // Esoteric-Pull
 	for(uint i=1u; i<7u; i+=2u) {
-		ghn[i   ] = load(gi, index_f(n    , t%2ul ? i    : i+1u));
-		ghn[i+1u] = load(gi, index_f(j7[i], t%2ul ? i+1u : i   ));
+		hhn[i   ] = load(hi, index_f(n    , t%2ul ? i    : i+1u));
+		hhn[i+1u] = load(hi, index_f(j7[i], t%2ul ? i+1u : i   ));
 	}
 }
-)+R(void store_g(const uxx n, const float* ghn, global fpxx* gi, const uxx* j7, const ulong t) {
-	store(gi, index_f(n, 0u), ghn[0]); // Esoteric-Pull
+)+R(void store_d3q7(const uxx n, const float* hhn, global fpxx* hi, const uxx* j7, const ulong t) {
+	store(hi, index_f(n, 0u), hhn[0]); // Esoteric-Pull
 	for(uint i=1u; i<7u; i+=2u) {
-		store(gi, index_f(j7[i], t%2ul ? i+1u : i   ), ghn[i   ]);
-		store(gi, index_f(n    , t%2ul ? i    : i+1u), ghn[i+1u]);
+		store(hi, index_f(j7[i], t%2ul ? i+1u : i   ), hhn[i   ]);
+		store(hi, index_f(n    , t%2ul ? i    : i+1u), hhn[i+1u]);
 	}
 }
-)+"#endif"+R( // TEMPERATURE
+)+"#endif"+R( // TEMPERATURE || SCALAR
 
 )+R(void load_f(const uxx n, float* fhn, const global fpxx* fi, const uxx* j, const ulong t) {
 	fhn[0] = load(fi, index_f(n, 0u)); // Esoteric-Pull
@@ -1368,6 +1368,9 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+"#ifdef TEMPERATURE"+R(
 	, global fpxx* gi, const global float* T // argument order is important
 )+"#endif"+R( // TEMPERATURE
+)+"#ifdef SCALAR"+R(
+	, global fpxx* ci, const global float* C // argument order is important
+)+"#endif"+R( // SCALAR
 )+") {"+R( // initialize()
 	const uxx n = get_global_id(0); // n = x+(y+z*Ny)*Nx
 	if(n>=(uxx)def_N||is_halo(n)) return; // don't execute initialize() on halo
@@ -1436,12 +1439,21 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+"#ifdef TEMPERATURE"+R(
 	{ // separate block to avoid variable name conflicts
 		float geq[7];
-		calculate_g_eq(T[n], u[n], u[def_N+(ulong)n], u[2ul*def_N+(ulong)n], geq);
+		calculate_d3q7_eq(T[n], u[n], u[def_N+(ulong)n], u[2ul*def_N+(ulong)n], geq);
 		uxx j7[7]; // neighbors of D3Q7 subset
-		neighbors_temperature(n, j7);
-		store_g(n, geq, gi, j7, 1ul);
+		neighbors_d3q7(n, j7);
+		store_d3q7(n, geq, gi, j7, 1ul);
 	}
 )+"#endif"+R( // TEMPERATURE
+)+"#ifdef SCALAR"+R(
+	{ // separate block to avoid variable name conflicts
+		float ceq[7];
+		calculate_d3q7_eq(C[n], u[n], u[def_N+(ulong)n], u[2ul*def_N+(ulong)n], ceq);
+		uxx j7[7]; // neighbors of D3Q7 subset
+		neighbors_d3q7(n, j7);
+		store_d3q7(n, ceq, ci, j7, 1ul);
+	}
+)+"#endif"+R( // SCALAR
 	store_f(n, feq, fi, j, 1ul); // write to fi
 } // initialize()
 
@@ -1477,6 +1489,9 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+"#ifdef TEMPERATURE"+R(
 	, global fpxx* gi, global float* T // argument order is important
 )+"#endif"+R( // TEMPERATURE
+)+"#ifdef SCALAR"+R(
+	, global fpxx* ci, global float* C // argument order is important
+)+"#endif"+R( // SCALAR
 )+") {"+R( // stream_collide()
 	const uxx n = get_global_id(0); // n = x+(y+z*Ny)*Nx
 	if(n>=(uxx)def_N||is_halo(n)) return; // don't execute stream_collide() on halo
@@ -1535,9 +1550,9 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+"#ifdef TEMPERATURE"+R(
 	{ // separate block to avoid variable name conflicts
 		uxx j7[7]; // neighbors of D3Q7 subset
-		neighbors_temperature(n, j7);
+		neighbors_d3q7(n, j7);
 		float ghn[7]; // read from gA and stream to gh (D3Q7 subset, periodic boundary conditions)
-		load_g(n, ghn, gi, j7, t); // perform streaming (part 2)
+		load_d3q7(n, ghn, gi, j7, t); // perform streaming (part 2)
 		float Tn;
 		if(flagsn&TYPE_T) {
 			Tn = T[n]; // apply preset temperature
@@ -1547,7 +1562,7 @@ string opencl_c_container() { return R( // ########################## begin of O
 			Tn += 1.0f; // add 1.0f last to avoid digit extinction effects when summing up gi (perturbation method / DDF-shifting)
 		}
 		float geq[7]; // cache f_equilibrium[n]
-		calculate_g_eq(Tn, uxn, uyn, uzn, geq); // calculate equilibrium DDFs
+		calculate_d3q7_eq(Tn, uxn, uyn, uzn, geq); // calculate equilibrium DDFs
 		if(flagsn&TYPE_T) {
 			for(uint i=0u; i<7u; i++) ghn[i] = geq[i]; // just write geq to ghn (no collision)
 		} else {
@@ -1556,12 +1571,41 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+"#endif"+R( // UPDATE_FIELDS
 			for(uint i=0u; i<7u; i++) ghn[i] = fma(1.0f-def_w_T, ghn[i], def_w_T*geq[i]); // perform collision
 		}
-		store_g(n, ghn, gi, j7, t); // perform streaming (part 1)
+		store_d3q7(n, ghn, gi, j7, t); // perform streaming (part 1)
 		fxn -= fx*def_beta*(Tn-def_T_avg);
 		fyn -= fy*def_beta*(Tn-def_T_avg);
 		fzn -= fz*def_beta*(Tn-def_T_avg);
 	}
 )+"#endif"+R( // TEMPERATURE
+
+)+"#ifdef SCALAR"+R(
+	{ // separate block to avoid variable name conflicts
+		uxx j7[7]; // neighbors of D3Q7 subset
+		neighbors_d3q7(n, j7);
+		float chn[7]; // scalar DDFs
+		load_d3q7(n, chn, ci, j7, t); // perform streaming (part 2)
+		float Cn;
+		if(flagsn&TYPE_C) {
+			Cn = C[n]; // apply preset concentration boundary
+		} else {
+			Cn = 0.0f;
+			for(uint i=0u; i<7u; i++) Cn += chn[i]; // calculate concentration from ci
+			Cn += 1.0f; // add 1.0f last (perturbation method / DDF-shifting)
+		}
+		float ceq[7]; // equilibrium DDFs
+		calculate_d3q7_eq(Cn, uxn, uyn, uzn, ceq); // calculate equilibrium DDFs
+		if(flagsn&TYPE_C) {
+			for(uint i=0u; i<7u; i++) chn[i] = ceq[i]; // fixed concentration boundary: just write ceq
+		} else {
+)+"#ifdef UPDATE_FIELDS"+R(
+			C[n] = Cn; // update concentration field
+)+"#endif"+R( // UPDATE_FIELDS
+			for(uint i=0u; i<7u; i++) chn[i] = fma(1.0f-def_w_C, chn[i], def_w_C*ceq[i]); // BGK collision for scalar
+		}
+		store_d3q7(n, chn, ci, j7, t); // perform streaming (part 1)
+		// no Boussinesq coupling — passive scalar
+	}
+)+"#endif"+R( // SCALAR
 
 	{ // separate block to avoid variable name conflicts
 )+"#ifdef VOLUME_FORCE"+R( // apply force and collision operator, write to fi in video memory
@@ -1816,6 +1860,9 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+"#ifdef TEMPERATURE"+R(
 	, const global fpxx* gi, global float* T // argument order is important
 )+"#endif"+R( // TEMPERATURE
+)+"#ifdef SCALAR"+R(
+	, const global fpxx* ci, global float* C // argument order is important
+)+"#endif"+R( // SCALAR
 )+") {"+R( // update_fields()
 	const uxx n = get_global_id(0); // n = x+(y+z*Ny)*Nx
 	if(n>=(uxx)def_N||is_halo(n)) return; // don't execute update_fields() on halo
@@ -1847,9 +1894,9 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+"#ifdef TEMPERATURE"+R(
 	{ // separate block to avoid variable name conflicts
 		uxx j7[7]; // neighbors of D3Q7 subset
-		neighbors_temperature(n, j7);
+		neighbors_d3q7(n, j7);
 		float ghn[7]; // read from gA and stream to gh (D3Q7 subset, periodic boundary conditions)
-		load_g(n, ghn, gi, j7, t); // perform streaming (part 2)
+		load_d3q7(n, ghn, gi, j7, t); // perform streaming (part 2)
 		float Tn;
 		if(flagsn&TYPE_T) {
 			Tn = T[n]; // apply preset temperature
@@ -1864,6 +1911,25 @@ string opencl_c_container() { return R( // ########################## begin of O
 		fzn -= fz*def_beta*(Tn-def_T_avg);
 	}
 )+"#endif"+R( // TEMPERATURE
+
+)+"#ifdef SCALAR"+R(
+	{ // separate block to avoid variable name conflicts
+		uxx j7[7]; // neighbors of D3Q7 subset
+		neighbors_d3q7(n, j7);
+		float chn[7]; // scalar DDFs
+		load_d3q7(n, chn, ci, j7, t); // perform streaming (part 2)
+		float Cn;
+		if(flagsn&TYPE_C) {
+			Cn = C[n]; // apply preset concentration boundary
+		} else {
+			Cn = 0.0f;
+			for(uint i=0u; i<7u; i++) Cn += chn[i]; // calculate concentration from ci
+			Cn += 1.0f; // add 1.0f last (perturbation method / DDF-shifting)
+			C[n] = Cn; // update concentration field
+		}
+		// no Boussinesq coupling — passive scalar
+	}
+)+"#endif"+R( // SCALAR
 
 	{ // separate block to avoid variable name conflicts
 )+"#ifdef VOLUME_FORCE"+R( // apply force and collision operator, write to fi in video memory
@@ -2251,14 +2317,14 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+"#ifdef TEMPERATURE"+R(
 )+R(void extract_gi(const uint a, const uxx n, const uint side, const ulong t, global fpxx_copy* transfer_buffer, const global fpxx_copy* gi) {
 	uxx j7[7u]; // neighbor indices
-	neighbors_temperature(n, j7); // calculate neighbor indices
+	neighbors_d3q7(n, j7); // calculate neighbor indices
 	const uint i = side+1u;
 	const ulong index = index_f(i%2u ? j7[i] : n, t%2ul ? (i%2u ? i+1u : i-1u) : i); // Esoteric-Pull: standard store, or streaming part 1/2
 	transfer_buffer[a] = gi[index]; // fpxx_copy allows direct copying without decompression+compression
 }
 )+R(void insert_gi(const uint a, const uxx n, const uint side, const ulong t, const global fpxx_copy* transfer_buffer, global fpxx_copy* gi) {
 	uxx j7[7u]; // neighbor indices
-	neighbors_temperature(n, j7); // calculate neighbor indices
+	neighbors_d3q7(n, j7); // calculate neighbor indices
 	const uint i = side+1u;
 	const ulong index = index_f(i%2u ? n : j7[i-1u], t%2ul ? i : (i%2u ? i+1u : i-1u)); // Esoteric-Pull: standard load, or streaming part 2/2
 	gi[index] = transfer_buffer[a]; // fpxx_copy allows direct copying without decompression+compression
@@ -2289,6 +2355,48 @@ string opencl_c_container() { return R( // ########################## begin of O
 	T[index_insert_m(a, direction)] = transfer_buffer_m[a];
 }
 )+"#endif"+R( // TEMPERATURE
+
+)+"#ifdef SCALAR"+R(
+)+R(void extract_ci(const uint a, const uxx n, const uint side, const ulong t, global fpxx_copy* transfer_buffer, const global fpxx_copy* ci) {
+	uxx j7[7u]; // neighbor indices
+	neighbors_d3q7(n, j7); // calculate neighbor indices
+	const uint i = side+1u;
+	const ulong index = index_f(i%2u ? j7[i] : n, t%2ul ? (i%2u ? i+1u : i-1u) : i); // Esoteric-Pull: standard store, or streaming part 1/2
+	transfer_buffer[a] = ci[index]; // fpxx_copy allows direct copying without decompression+compression
+}
+)+R(void insert_ci(const uint a, const uxx n, const uint side, const ulong t, const global fpxx_copy* transfer_buffer, global fpxx_copy* ci) {
+	uxx j7[7u]; // neighbor indices
+	neighbors_d3q7(n, j7); // calculate neighbor indices
+	const uint i = side+1u;
+	const ulong index = index_f(i%2u ? n : j7[i-1u], t%2ul ? i : (i%2u ? i+1u : i-1u)); // Esoteric-Pull: standard load, or streaming part 2/2
+	ci[index] = transfer_buffer[a]; // fpxx_copy allows direct copying without decompression+compression
+}
+)+R(kernel void transfer_extract_ci(const uint direction, const ulong t, global fpxx_copy* transfer_buffer_p, global fpxx_copy* transfer_buffer_m, const global fpxx_copy* ci) {
+	const uint a=get_global_id(0), A=get_area(direction); // a = domain area index for each side, A = area of the domain boundary
+	if(a>=A) return; // area might not be a multiple of cl_workgroup_size, so return here to avoid writing in unallocated memory space
+	extract_ci(a, index_extract_p(a, direction), 2u*direction+0u, t, transfer_buffer_p, ci);
+	extract_ci(a, index_extract_m(a, direction), 2u*direction+1u, t, transfer_buffer_m, ci);
+}
+)+R(kernel void transfer__insert_ci(const uint direction, const ulong t, const global fpxx_copy* transfer_buffer_p, const global fpxx_copy* transfer_buffer_m, global fpxx_copy* ci) {
+	const uint a=get_global_id(0), A=get_area(direction); // a = domain area index for each side, A = area of the domain boundary
+	if(a>=A) return; // area might not be a multiple of cl_workgroup_size, so return here to avoid writing in unallocated memory space
+	insert_ci(a, index_insert_p(a, direction), 2u*direction+0u, t, transfer_buffer_p, ci);
+	insert_ci(a, index_insert_m(a, direction), 2u*direction+1u, t, transfer_buffer_m, ci);
+}
+
+)+R(kernel void transfer_extract_C(const uint direction, const ulong t, global float* transfer_buffer_p, global float* transfer_buffer_m, const global float* C) {
+	const uint a=get_global_id(0), A=get_area(direction); // a = domain area index for each side, A = area of the domain boundary
+	if(a>=A) return; // area might not be a multiple of cl_workgroup_size, so return here to avoid writing in unallocated memory space
+	transfer_buffer_p[a] = C[index_extract_p(a, direction)];
+	transfer_buffer_m[a] = C[index_extract_m(a, direction)];
+}
+)+R(kernel void transfer__insert_C(const uint direction, const ulong t, const global float* transfer_buffer_p, const global float* transfer_buffer_m, global float* C) {
+	const uint a=get_global_id(0), A=get_area(direction); // a = domain area index for each side, A = area of the domain boundary
+	if(a>=A) return; // area might not be a multiple of cl_workgroup_size, so return here to avoid writing in unallocated memory space
+	C[index_insert_p(a, direction)] = transfer_buffer_p[a];
+	C[index_insert_m(a, direction)] = transfer_buffer_m[a];
+}
+)+"#endif"+R( // SCALAR
 
 
 

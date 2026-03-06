@@ -93,6 +93,9 @@ void Info::print_initialize(LBM* lbm) {
 	println("| Thermal Diff.   | "+alignr(57u, /**********************************************************************************/ to_string(lbm->get_alpha(), 8u))+" |");
 	println("| Thermal Exp.    | "+alignr(57u, /***********************************************************************************/ to_string(lbm->get_beta(), 8u))+" |");
 #endif // TEMPERATURE
+#ifdef SCALAR
+	println("| Scalar Diff.    | "+alignr(57u, /**********************************************************************************/ to_string(lbm->get_alpha(), 8u))+" |");
+#endif // SCALAR
 #ifndef INTERACTIVE_GRAPHICS_ASCII
 	println("|---------.-------'-----.-----------.-------------------.---------------------|");
 	println("| MLUPs   | Bandwidth   | Steps/s   | Current Step      | "+string(steps==max_ulong?"Elapsed Time  ":"Time Remaining")+"      |");

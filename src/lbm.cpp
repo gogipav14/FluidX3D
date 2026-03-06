@@ -33,6 +33,9 @@ uint bytes_per_cell_host() { // returns the number of Bytes per cell allocated i
 #ifdef TEMPERATURE
 	bytes_per_cell += 4u; // T
 #endif // TEMPERATURE
+#ifdef SCALAR
+	bytes_per_cell += 4u; // C
+#endif // SCALAR
 	return bytes_per_cell;
 }
 uint bytes_per_cell_device() { // returns the number of Bytes per cell allocated in device memory
@@ -46,6 +49,9 @@ uint bytes_per_cell_device() { // returns the number of Bytes per cell allocated
 #ifdef TEMPERATURE
 	bytes_per_cell += 7u*sizeof(fpxx)+4u; // gi, T
 #endif // TEMPERATURE
+#ifdef SCALAR
+	bytes_per_cell += 7u*sizeof(fpxx)+4u; // ci, C
+#endif // SCALAR
 	return bytes_per_cell;
 }
 uint bandwidth_bytes_per_cell_device() { // returns the bandwidth in Bytes per cell per time step from/to device memory
@@ -55,19 +61,25 @@ uint bandwidth_bytes_per_cell_device() { // returns the bandwidth in Bytes per c
 #ifdef TEMPERATURE
 	bandwidth_bytes_per_cell += 4u; // T
 #endif // TEMPERATURE
+#ifdef SCALAR
+	bandwidth_bytes_per_cell += 4u; // C
+#endif // SCALAR
 #endif // UPDATE_FIELDS
 #ifdef FORCE_FIELD
 	bandwidth_bytes_per_cell += 12u; // F
 #endif // FORCE_FIELD
-#if defined(MOVING_BOUNDARIES)||defined(SURFACE)||defined(TEMPERATURE)
+#if defined(MOVING_BOUNDARIES)||defined(SURFACE)||defined(TEMPERATURE)||defined(SCALAR)
 	bandwidth_bytes_per_cell += (velocity_set-1u)*1u; // neighbor flags have to be loaded
-#endif // MOVING_BOUNDARIES, SURFACE or TEMPERATURE
+#endif // MOVING_BOUNDARIES, SURFACE, TEMPERATURE or SCALAR
 #ifdef SURFACE
 	bandwidth_bytes_per_cell += (1u+(2u*velocity_set-1u)*sizeof(fpxx)+8u+(velocity_set-1u)*4u) + 1u + 1u + (4u+velocity_set+4u+4u+4u); // surface_0 (flags, fi, mass, massex), surface_1 (flags), surface_2 (flags), surface_3 (rho, flags, mass, massex, phi)
 #endif // SURFACE
 #ifdef TEMPERATURE
 	bandwidth_bytes_per_cell += 7u*2u*sizeof(fpxx); // 2*gi
 #endif // TEMPERATURE
+#ifdef SCALAR
+	bandwidth_bytes_per_cell += 7u*2u*sizeof(fpxx); // 2*ci
+#endif // SCALAR
 	return bandwidth_bytes_per_cell;
 }
 uint3 resolution(const float3 box_aspect_ratio, const uint memory) { // input: simulation box aspect ratio and VRAM occupation in MB, output: grid resolution
@@ -163,6 +175,14 @@ void LBM_Domain::allocate(Device& device) {
 	kernel_stream_collide.add_parameters(gi, T);
 	kernel_update_fields.add_parameters(gi, T);
 #endif // TEMPERATURE
+
+#ifdef SCALAR
+	ci = Memory<fpxx>(device, N, 7u, false);
+	C = Memory<float>(device, N, 1u, true, true, 0.0f); // default concentration = 0
+	kernel_initialize.add_parameters(ci, C);
+	kernel_stream_collide.add_parameters(ci, C);
+	kernel_update_fields.add_parameters(ci, C);
+#endif // SCALAR
 
 #ifdef PARTICLES
 	particles = Memory<float>(device, (ulong)particles_N, 3u);
@@ -397,6 +417,7 @@ string LBM_Domain::device_defines() const { return
 	"\n	#define TYPE_I 0x10" // 0b00010000 // interface
 	"\n	#define TYPE_G 0x20" // 0b00100000 // gas
 	"\n	#define TYPE_X 0x40" // 0b01000000 // reserved type X
+	"\n	#define TYPE_C 0x40" // 0b01000000 // scalar concentration boundary (alias for TYPE_X)
 	"\n	#define TYPE_Y 0x80" // 0b10000000 // reserved type Y
 
 	"\n	#define TYPE_MS 0x03" // 0b00000011 // cell next to moving solid boundary
@@ -454,6 +475,11 @@ string LBM_Domain::device_defines() const { return
 	"\n	#define def_beta "+to_string(beta)+"f" // thermal expansion coefficient
 	"\n	#define def_T_avg "+to_string(T_avg)+"f" // average temperature
 #endif // TEMPERATURE
+
+#ifdef SCALAR
+	"\n	#define SCALAR"
+	"\n	#define def_w_C "+to_string(1.0f/(2.0f*alpha+0.5f))+"f" // wC = dt/tauC = 1/(2*D_scalar+1/2), D_scalar passed as alpha in LBM constructor
+#endif // SCALAR
 
 #ifdef SUBGRID
 	"\n	#define SUBGRID"
@@ -730,6 +756,12 @@ LBM::LBM(const uint Nx, const uint Ny, const uint Nz, const uint Dx, const uint 
 		T = Memory_Container(this, buffers_T, "T");
 #endif // TEMPERATURE
 	} {
+#ifdef SCALAR
+		Memory<float>** buffers_C = new Memory<float>*[D];
+		for(uint d=0u; d<D; d++) buffers_C[d] = &(lbm_domain[d]->C);
+		C = Memory_Container(this, buffers_C, "C");
+#endif // SCALAR
+	} {
 #ifdef PARTICLES
 		particles = &(lbm_domain[0]->particles);
 #endif // PARTICLES
@@ -786,11 +818,15 @@ void LBM::sanity_checks_constructor(const vector<Device_Info>& device_infos, con
 #ifndef SURFACE
 	if(sigma!=0.0f) print_error("Surface tension is set in LBM constructor in main_setup(), but SURFACE is not enabled. Uncomment \"#define SURFACE\" in defines.hpp.");
 #endif // SURFACE
-#ifndef TEMPERATURE
-	if(alpha!=0.0f||beta!=0.0f) print_error("Thermal diffusion/expansion coefficients are set in LBM constructor in main_setup(), but TEMPERATURE is not enabled. Uncomment \"#define TEMPERATURE\" in defines.hpp.");
-#else // TEMPERATURE
+#if !defined(TEMPERATURE)&&!defined(SCALAR)
+	if(alpha!=0.0f||beta!=0.0f) print_error("Thermal diffusion/expansion coefficients are set in LBM constructor in main_setup(), but neither TEMPERATURE nor SCALAR is enabled. Uncomment \"#define TEMPERATURE\" or \"#define SCALAR\" in defines.hpp.");
+#endif // !TEMPERATURE&&!SCALAR
+#ifdef TEMPERATURE
 	if(alpha==0.0f&&beta==0.0f) print_warning("The TEMPERATURE extension is enabled but the thermal diffusion/expansion coefficients alpha/beta in the LBM constructor are both set to zero. You may disable the extension by commenting out \"#define TEMPERATURE\" in defines.hpp.");
 #endif // TEMPERATURE
+#ifdef SCALAR
+	if(alpha==0.0f) print_warning("The SCALAR extension is enabled but the scalar diffusivity (alpha parameter) in the LBM constructor is set to zero.");
+#endif // SCALAR
 #ifdef PARTICLES
 	if(particles_N==0u) print_error("The PARTICLES extension is enabled but the number of particles is set to 0. Comment out \"#define PARTICLES\" in defines.hpp.");
 #if !defined(VOLUME_FORCE)||!defined(FORCE_FIELD)
@@ -863,6 +899,9 @@ void LBM::initialize() { // write all data fields to device and call kernel_init
 #ifdef TEMPERATURE
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->T.enqueue_write_to_device();
 #endif // TEMPERATURE
+#ifdef SCALAR
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->C.enqueue_write_to_device();
+#endif // SCALAR
 #ifdef PARTICLES
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->particles.enqueue_write_to_device();
 	communicate_particles();
@@ -883,6 +922,10 @@ void LBM::initialize() { // write all data fields to device and call kernel_init
 	communicate_T(); // T halo data is required for field_slice rendering
 	communicate_gi(); // time step must be odd here
 #endif // TEMPERATURE
+#ifdef SCALAR
+	communicate_C(); // C halo data may be needed for rendering
+	communicate_ci(); // time step must be odd here
+#endif // SCALAR
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->reset_time_step(); // set time step to 0 again
 	initialized = true;
@@ -911,6 +954,12 @@ void LBM::do_time_step() { // call kernel_stream_collide to perform one LBM time
 #endif // GRAPHICS
 	communicate_gi();
 #endif // TEMPERATURE
+#ifdef SCALAR
+#ifdef GRAPHICS
+	communicate_C(); // C halo data may be needed for rendering
+#endif // GRAPHICS
+	communicate_ci();
+#endif // SCALAR
 #ifdef PARTICLES
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_integrate_particles(); // intgegrate particles forward in time and couple particles to fluid
 	communicate_particles(); // communicate_F() is not required in do_time_step()
@@ -1034,6 +1083,9 @@ void LBM::write_status(const string& path) { // write LBM status report to a .tx
 	status += "Thermal Diffusion Coefficient = "+to_string(get_alpha())+"\n";
 	status += "Thermal Expansion Coefficient = "+to_string(get_beta())+"\n";
 #endif // TEMPERATURE
+#ifdef SCALAR
+	status += "Scalar Diffusion Coefficient = "+to_string(get_alpha())+"\n";
+#endif // SCALAR
 	const string filename = default_filename(path, "status", ".txt", get_t());
 	write_file(filename, status);
 }
@@ -1301,6 +1353,12 @@ void LBM_Domain::allocate_transfer(Device& device) { // allocate all memory for 
 	kernel_transfer[enum_transfer_field::T               ][0] = Kernel(device, 0u, "transfer_extract_T"               , 0u, t, transfer_buffer_p, transfer_buffer_m, T);
 	kernel_transfer[enum_transfer_field::T               ][1] = Kernel(device, 0u, "transfer__insert_T"               , 0u, t, transfer_buffer_p, transfer_buffer_m, T);
 #endif // TEMPERATURE
+#ifdef SCALAR
+	kernel_transfer[enum_transfer_field::ci              ][0] = Kernel(device, 0u, "transfer_extract_ci"              , 0u, t, transfer_buffer_p, transfer_buffer_m, ci);
+	kernel_transfer[enum_transfer_field::ci              ][1] = Kernel(device, 0u, "transfer__insert_ci"              , 0u, t, transfer_buffer_p, transfer_buffer_m, ci);
+	kernel_transfer[enum_transfer_field::C               ][0] = Kernel(device, 0u, "transfer_extract_C"               , 0u, t, transfer_buffer_p, transfer_buffer_m, C);
+	kernel_transfer[enum_transfer_field::C               ][1] = Kernel(device, 0u, "transfer__insert_C"               , 0u, t, transfer_buffer_p, transfer_buffer_m, C);
+#endif // SCALAR
 }
 
 ulong LBM_Domain::get_area(const uint direction) {
@@ -1376,6 +1434,14 @@ void LBM::communicate_T() {
 	communicate_field(enum_transfer_field::T, 4u);
 }
 #endif // TEMPERATURE
+#ifdef SCALAR
+void LBM::communicate_ci() {
+	communicate_field(enum_transfer_field::ci, sizeof(fpxx));
+}
+void LBM::communicate_C() {
+	communicate_field(enum_transfer_field::C, 4u);
+}
+#endif // SCALAR
 #ifdef PARTICLES
 void LBM::communicate_particles() {
 	if(get_D()>1u) {
