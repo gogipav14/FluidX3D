@@ -39,7 +39,8 @@ void moment_transform(const double f[Q], double m[Q]) {
 }
 
 double compute_eps_g_hat(const double f[Q], double tau_plus, double Ma,
-                         const int* subspace, int n_subspace) {
+                         const int* subspace, int n_subspace,
+                         bool subtract_rest) {
     double rho = 0.0, jx = 0.0, jy = 0.0;
     for (int i = 0; i < Q; ++i) {
         rho += f[i];
@@ -50,7 +51,11 @@ double compute_eps_g_hat(const double f[Q], double tau_plus, double Ma,
     const double uy = jy / rho;
 
     double feq[Q];
-    compute_feq(rho, ux, uy, feq);
+    // Rest reference (Paper 1 kick): subtract f_eq(rho, 0) so f_neq is the
+    // injection relative to rest. Local reference (Paper 2 F_gh): subtract
+    // f_eq(rho, u_local). See header.
+    if (subtract_rest) compute_feq(rho, 0.0, 0.0, feq);
+    else               compute_feq(rho, ux, uy, feq);
 
     double f_neq[Q];
     for (int i = 0; i < Q; ++i) f_neq[i] = f[i] - feq[i];
@@ -68,8 +73,9 @@ double compute_eps_g_hat(const double f[Q], double tau_plus, double Ma,
     return eps_g_bnd / (tau_plus * tau_plus * Ma * Ma);
 }
 
-double compute_eps_g_hat_full(const double f[Q], double tau_plus, double Ma) {
-    return compute_eps_g_hat(f, tau_plus, Ma, NON_CONSERVED, 6);
+double compute_eps_g_hat_full(const double f[Q], double tau_plus, double Ma,
+                              bool subtract_rest) {
+    return compute_eps_g_hat(f, tau_plus, Ma, NON_CONSERVED, 6, subtract_rest);
 }
 
 void build_synthetic_ladd_top_wall_x(double u_w, double tau_plus, double f_synth[Q]) {
@@ -261,7 +267,7 @@ bool v1_hook_tick(V1Hook& hook,
     for (int x = x_lo; x <= x_hi; ++x) {
         reconstruct_post_collision_D2Q9(fi_raw, N, x, y, Nx, Ny, t_store, fhn_FX);
         fluidx3d_to_LL_D2Q9(fhn_FX, f_LL);
-        const double eg = compute_eps_g_hat_full(f_LL, hook.tau_plus, Ma);
+        const double eg = compute_eps_g_hat_full(f_LL, hook.tau_plus, Ma, hook.kick_rest_reference);
 
         ++n;
         const double delta  = eg - mean;

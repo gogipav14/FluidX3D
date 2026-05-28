@@ -78,11 +78,24 @@ void moment_transform(const double f[Q], double m[Q]);
 //
 // `subspace` enumerates which moment indices contribute. For the V1 gate
 // pass NON_CONSERVED with n_subspace=6.
+//
+// `subtract_rest` selects the equilibrium reference for f_neq:
+//   false (default) -> f_neq = f - f_eq(rho, u_local). This is Paper 2's F_gh
+//          definition ("variance of the non-hydrodynamic moments"), a deviation
+//          from LOCAL equilibrium. Use for steady-state / bulk diagnostics.
+//   true            -> f_neq = f - f_eq(rho, 0) (REST reference). This projects
+//          the wall INJECTION relative to rest, matching Paper 1's source
+//          invariant / single-step kick (E_g^kick = (5/18) Ma^2). Use for the
+//          from-rest kick gate. NOTE: only meaningful when the pre-injection
+//          base state is rest (the V1 kick protocol); for a developed flow the
+//          rest reference would fold the hydrodynamic momentum into f_neq.
 double compute_eps_g_hat(const double f[Q], double tau_plus, double Ma,
-                         const int* subspace, int n_subspace);
+                         const int* subspace, int n_subspace,
+                         bool subtract_rest = false);
 
 // Convenience wrapper using the full non-conserved subspace (V1 gate definition).
-double compute_eps_g_hat_full(const double f[Q], double tau_plus, double Ma);
+double compute_eps_g_hat_full(const double f[Q], double tau_plus, double Ma,
+                              bool subtract_rest = false);
 
 // ---- off-line verification helper ----
 
@@ -153,6 +166,8 @@ struct V1Hook {
     double tau_plus = 0.0;            // BGK relaxation time
     unsigned long long sample_step_start = 100000ULL;
     unsigned long long sample_cadence  = 5000ULL;
+    bool kick_rest_reference = false; // true: rest-referenced source gate (Paper 1 kick, 5/18);
+                                      // false: local-eq F_gh variance (Paper 2 definition)
     const char* build_hash = "unknown";
 
     // Internal state

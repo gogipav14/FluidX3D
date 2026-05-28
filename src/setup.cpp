@@ -39,57 +39,95 @@ void main_setup() { // benchmark; required extensions in defines.hpp: BENCHMARK,
 
 #if defined(PAPER3_GHOST_DIAG)
 #include "paper3_diag.hpp"
-void main_setup() { // Paper 3 V1: translating-lid Couette ghost-energy gate
-	// Required extensions in defines.hpp: D2Q9, MOVING_BOUNDARIES, PAPER3_GHOST_DIAG;
-	// must NOT have BENCHMARK, FP16S, or FP16C (the #error guards enforce this).
-	//
-	// Measures the V1 gate eps_g_hat = 5/18 at the moving (top) wall under the
-	// B_Ladd operator. See plans/paper3_phase_B_v1_checklist.md (§2 geometry,
-	// §4 protocol) and plans/paper3_d2q9_face_wall_derivation.md (target value).
-	//
-	// Sweep: re-run with UW_INDEX = 0, 1, 2 (three builds, or change + recompile)
-	// to cover u_w in {0.02, 0.04, 0.08}; each writes its own CSV. Holding tau_+
-	// fixed across the sweep keeps the collision response identical (checklist §2).
-	const int UW_INDEX = 1; // 0 -> 0.02, 1 -> 0.04, 2 -> 0.08
-	const float UW_VALUES[3] = { 0.02f, 0.04f, 0.08f };
-	const char* CSV_PATHS[3] = { "paper3_v1_ghost_uw002.csv", "paper3_v1_ghost_uw004.csv", "paper3_v1_ghost_uw008.csv" };
-	const float u_w = UW_VALUES[UW_INDEX];
 
-	const uint Nx = 64u, Ny = 32u;
-	const float tau_plus = 0.55f;
-	const float nu = (tau_plus - 0.5f) / 3.0f; // nu = c_s^2 (tau_+ - 1/2), c_s^2 = 1/3  -> 1/60
-
+// Helper: configure + run one translating-wall case and dump the hook CSV.
+// Reused by both the kick test and the (retained, refuted) steady gate.
+static void paper3_run_translating_wall(const char* csv_path, uint Nx, uint Ny,
+		float u_w, float tau_plus, unsigned long long steps,
+		unsigned long long sample_start, unsigned long long sample_cadence,
+		bool dump_profile, bool rest_reference) {
+	const float nu = (tau_plus - 0.5f) / 3.0f; // nu = c_s^2 (tau_+ - 1/2), c_s^2 = 1/3
 	LBM lbm(Nx, Ny, 1u, nu);
-
-	// ###################################################################################### define geometry ######################################################################################
 	const uint NxL=lbm.get_Nx(), NyL=lbm.get_Ny(); parallel_for(lbm.get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lbm.coordinates(n, x, y, z);
-		// x is periodic (no flags); bottom and top rows are solid walls.
+		// x periodic; bottom + top rows solid; top wall translates in +x.
+		// Fluid initial condition is rest (u=0) -> for the kick test this is the
+		// Paper 1 Level B rest state f_i = w_i; the first step is the single kick.
 		if(y==0u || y==NyL-1u) lbm.flags[n] = TYPE_S;
-		if(y==NyL-1u) lbm.u.x[n] = u_w; // top wall translates in +x -> B_Ladd injection
+		if(y==NyL-1u) lbm.u.x[n] = u_w;
 	});
-
-	// configure the ghost-energy hook (host-side, driven by LBM::run())
-	paper3::g_v1_hook = paper3::V1Hook{}; // reset to defaults
-	paper3::g_v1_hook.csv_path = CSV_PATHS[UW_INDEX];
+	paper3::g_v1_hook = paper3::V1Hook{}; // reset (clears readback_validated, csv_handle, ...)
+	paper3::g_v1_hook.csv_path = csv_path;
 	paper3::g_v1_hook.Nx = (int)NxL;
 	paper3::g_v1_hook.Ny = (int)NyL;
-	paper3::g_v1_hook.wall_y = (int)NyL - 2; // wall-adjacent fluid row below the moving top wall
+	paper3::g_v1_hook.wall_y = (int)NyL - 2;
 	paper3::g_v1_hook.corner_buffer = 4;
 	paper3::g_v1_hook.u_w = (double)u_w;
 	paper3::g_v1_hook.tau_plus = (double)tau_plus;
-	paper3::g_v1_hook.sample_step_start = 100000ULL;
-	paper3::g_v1_hook.sample_cadence    = 5000ULL;
-
-	// run to steady state; T_max = 350,000 >= 5 * tau_visc (= 5 * Ny^2/nu) (checklist §2)
-	lbm.run(350000ull);
-
-	// macroscopic sanity: dump the final x-velocity profile (should be linear Couette)
-	lbm.u.read_from_device();
-	print_info("V1 final u_x(y) profile (expect linear 0 -> u_w):");
-	for(uint y=0u; y<NyL; y++) {
-		const ulong n = (ulong)(NxL/2u) + (ulong)y*(ulong)NxL;
-		print_info("  y="+to_string(y)+"  u_x="+to_string(lbm.u.x[n], 6u));
+	paper3::g_v1_hook.sample_step_start = sample_start;
+	paper3::g_v1_hook.sample_cadence    = sample_cadence;
+	paper3::g_v1_hook.kick_rest_reference = rest_reference;
+	lbm.run(steps);
+	if(dump_profile) {
+		lbm.u.read_from_device();
+		print_info("final u_x(y) profile (expect linear 0 -> u_w):");
+		for(uint y=0u; y<NyL; y++) { const ulong n=(ulong)(NxL/2u)+(ulong)y*(ulong)NxL;
+			print_info("  y="+to_string(y)+"  u_x="+to_string(lbm.u.x[n], 6u)); }
 	}
+}
+
+void main_setup() { // Paper 3 V1
+	// Required extensions in defines.hpp: D2Q9, MOVING_BOUNDARIES, PAPER3_GHOST_DIAG;
+	// must NOT have BENCHMARK, FP16S, or FP16C (the #error guards enforce this).
+	//
+	// MODE. The original steady-state per-cell gate (eps_g_hat = 5/18) was REFUTED
+	// by the live run (it measured the hydrodynamic shear, not a persistent ghost;
+	// the ghost streams away). See plans/paper3_v1_findings.md. The reformulated V1
+	// is the Paper 1 Level B SINGLE-STEP KICK, which is the operationally validated
+	// test of the universal source: from rest, one bounce-back step injects ghost
+	// energy E_g^kick = (5/18) Ma^2 (Paper 1 eq:E_kick, Fig kick_test).
+	//
+	// The kick gate uses the REST reference (kick_rest_reference=true): f_neq is
+	// the injection relative to rest, projecting Paper 1's source. The hook reads
+	// POST-collision, so one BGK step relaxes the ghost by (1-1/tau_+):
+	//   reported eps_g_hat(step 2) = (1-1/tau_+)^2 * (5/18) / tau_+^2
+	//   => E_g/Ma^2 = eps_g_hat * tau_+^2 = (1-1/tau_+)^2 * (5/18).
+	// Collision-free limit (tau_+ -> inf): E_g/Ma^2 -> 5/18 exactly (= Paper 1 Level B,
+	// confirmed live to within the (1-1/tau_+)^2 collision leak). The tau_+ sweep
+	// confirms both the injection magnitude AND the single-step BGK response factor.
+	// Analyze: E_g/Ma^2 = (col eps_g_hat)*(tau_+^2).
+	//
+	// NOTE on the reference: with the LOCAL-eq reference (Paper 2's F_gh definition)
+	// the fresh kick reads ~0.358, not 5/18, because the just-kicked cell carries its
+	// momentum only in the diagonal populations and subtracting f_eq(u_local) adds a
+	// spurious q_x from the axis directions. The rest reference is the one that maps
+	// to Paper 1's universal source. See plans/paper3_v1_reformulation.md.
+	const bool KICK_TEST = true;
+
+	const uint Nx = 64u, Ny = 32u;
+	const float u_w = 0.04f; // Ma = u_w/c_s = 0.0693
+
+	if(KICK_TEST) {
+		// Sweep tau_+ from production (0.55) to near-collision-free (256). The
+		// near-free case reproduces Paper 1's 5/18; the sweep maps (1-1/tau_+)^2.
+		// Sample every step from get_t()=2 (after the single kick) through the
+		// transient decay, so the CSV shows the kick peak and its streaming decay.
+		const int NTAU = 4;
+		const float TAUS[NTAU]   = { 0.55f, 1.5f, 16.0f, 256.0f };
+		const char* PATHS[NTAU]  = { "paper3_v1_kick_tau0p55.csv", "paper3_v1_kick_tau1p5.csv",
+		                             "paper3_v1_kick_tau16.csv",   "paper3_v1_kick_tau256.csv" };
+		for(int k=0; k<NTAU; k++) {
+			print_info("=== Paper 3 V1 kick test (rest ref): tau_+ = "+to_string(TAUS[k], 4u)+" ===");
+			paper3_run_translating_wall(PATHS[k], Nx, Ny, u_w, TAUS[k],
+				/*steps*/40ull, /*sample_start*/2ull, /*cadence*/1ull,
+				/*dump_profile*/false, /*rest_reference*/true);
+		}
+		return;
+	}
+
+	// --- Retained for reference only: the REFUTED steady-state gate (local-eq ref). ---
+	paper3_run_translating_wall("paper3_v1_ghost_uw004.csv", Nx, Ny, u_w, 0.55f,
+		/*steps*/350000ull, /*sample_start*/100000ull, /*cadence*/5000ull,
+		/*dump_profile*/true, /*rest_reference*/false);
 }
 #endif // PAPER3_GHOST_DIAG
 
