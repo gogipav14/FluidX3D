@@ -37,6 +37,64 @@ void main_setup() { // benchmark; required extensions in defines.hpp: BENCHMARK,
 
 
 
+#if defined(PAPER3_GHOST_DIAG)
+#include "paper3_diag.hpp"
+void main_setup() { // Paper 3 V1: translating-lid Couette ghost-energy gate
+	// Required extensions in defines.hpp: D2Q9, MOVING_BOUNDARIES, PAPER3_GHOST_DIAG;
+	// must NOT have BENCHMARK, FP16S, or FP16C (the #error guards enforce this).
+	//
+	// Measures the V1 gate eps_g_hat = 5/18 at the moving (top) wall under the
+	// B_Ladd operator. See plans/paper3_phase_B_v1_checklist.md (§2 geometry,
+	// §4 protocol) and plans/paper3_d2q9_face_wall_derivation.md (target value).
+	//
+	// Sweep: re-run with UW_INDEX = 0, 1, 2 (three builds, or change + recompile)
+	// to cover u_w in {0.02, 0.04, 0.08}; each writes its own CSV. Holding tau_+
+	// fixed across the sweep keeps the collision response identical (checklist §2).
+	const int UW_INDEX = 1; // 0 -> 0.02, 1 -> 0.04, 2 -> 0.08
+	const float UW_VALUES[3] = { 0.02f, 0.04f, 0.08f };
+	const char* CSV_PATHS[3] = { "paper3_v1_ghost_uw002.csv", "paper3_v1_ghost_uw004.csv", "paper3_v1_ghost_uw008.csv" };
+	const float u_w = UW_VALUES[UW_INDEX];
+
+	const uint Nx = 64u, Ny = 32u;
+	const float tau_plus = 0.55f;
+	const float nu = (tau_plus - 0.5f) / 3.0f; // nu = c_s^2 (tau_+ - 1/2), c_s^2 = 1/3  -> 1/60
+
+	LBM lbm(Nx, Ny, 1u, nu);
+
+	// ###################################################################################### define geometry ######################################################################################
+	const uint NxL=lbm.get_Nx(), NyL=lbm.get_Ny(); parallel_for(lbm.get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lbm.coordinates(n, x, y, z);
+		// x is periodic (no flags); bottom and top rows are solid walls.
+		if(y==0u || y==NyL-1u) lbm.flags[n] = TYPE_S;
+		if(y==NyL-1u) lbm.u.x[n] = u_w; // top wall translates in +x -> B_Ladd injection
+	});
+
+	// configure the ghost-energy hook (host-side, driven by LBM::run())
+	paper3::g_v1_hook = paper3::V1Hook{}; // reset to defaults
+	paper3::g_v1_hook.csv_path = CSV_PATHS[UW_INDEX];
+	paper3::g_v1_hook.Nx = (int)NxL;
+	paper3::g_v1_hook.Ny = (int)NyL;
+	paper3::g_v1_hook.wall_y = (int)NyL - 2; // wall-adjacent fluid row below the moving top wall
+	paper3::g_v1_hook.corner_buffer = 4;
+	paper3::g_v1_hook.u_w = (double)u_w;
+	paper3::g_v1_hook.tau_plus = (double)tau_plus;
+	paper3::g_v1_hook.sample_step_start = 100000ULL;
+	paper3::g_v1_hook.sample_cadence    = 5000ULL;
+
+	// run to steady state; T_max = 350,000 >= 5 * tau_visc (= 5 * Ny^2/nu) (checklist §2)
+	lbm.run(350000ull);
+
+	// macroscopic sanity: dump the final x-velocity profile (should be linear Couette)
+	lbm.u.read_from_device();
+	print_info("V1 final u_x(y) profile (expect linear 0 -> u_w):");
+	for(uint y=0u; y<NyL; y++) {
+		const ulong n = (ulong)(NxL/2u) + (ulong)y*(ulong)NxL;
+		print_info("  y="+to_string(y)+"  u_x="+to_string(lbm.u.x[n], 6u));
+	}
+}
+#endif // PAPER3_GHOST_DIAG
+
+
+
 /*void main_setup() { // 3D Taylor-Green vortices; required extensions in defines.hpp: INTERACTIVE_GRAPHICS
 	// ################################################################## define simulation box size, viscosity and volume force ###################################################################
 	LBM lbm(128u, 128u, 128u, 1u, 1u, 1u, 0.01f);

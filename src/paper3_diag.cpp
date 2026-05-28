@@ -98,6 +98,54 @@ void LL_to_fluidx3d_D2Q9(const double f_LL[Q], float f_FX[Q]) {
     for (int k = 0; k < Q; ++k) f_FX[ll_to_fx[k]] = (float) f_LL[k];
 }
 
+// ---- Esoteric-Pull post-collision reconstruction ----
+
+void reconstruct_post_collision_D2Q9(const float* fi, unsigned long N,
+                                     int x, int y, int Nx, int Ny,
+                                     unsigned long long t_store,
+                                     float fhn_FX[Q]) {
+    // FluidX3D D2Q9 neighbor indices with periodic BC (matches neighbors() in
+    // kernel.cpp). n = x + y*Nx for the 2D (Nz=1) case.
+    const unsigned long x0 = (unsigned long) x;
+    const unsigned long xp = (unsigned long)((x + 1) % Nx);
+    const unsigned long xm = (unsigned long)((x + Nx - 1) % Nx);
+    const unsigned long y0 = (unsigned long) y * (unsigned long) Nx;
+    const unsigned long yp = (unsigned long)(((y + 1) % Ny)) * (unsigned long) Nx;
+    const unsigned long ym = (unsigned long)(((y + Ny - 1) % Ny)) * (unsigned long) Nx;
+    unsigned long j[Q];
+    j[0] = x0 + y0; // = n
+    j[1] = xp + y0; j[2] = xm + y0;
+    j[3] = x0 + yp; j[4] = x0 + ym;
+    j[5] = xp + yp; j[6] = xm + ym;
+    j[7] = xp + ym; j[8] = xm + yp;
+
+    const bool odd = (t_store % 2ULL) != 0ULL;
+
+    // Invert store_f() (kernel.cpp):
+    //   fi[index_f(n, 0)]                       = fhn[0];
+    //   fi[index_f(j[i], odd ? i+1 : i  )]      = fhn[i];     (i odd)
+    //   fi[index_f(n,    odd ? i   : i+1)]      = fhn[i+1];   (i odd)
+    // with index_f(cell, dir) = dir*N + cell.
+    fhn_FX[0] = fi[0u * N + j[0]];
+    for (int i = 1; i < Q; i += 2) {
+        const int dir_i   = odd ? (i + 1) : i;
+        const int dir_ip1 = odd ? i : (i + 1);
+        fhn_FX[i]     = fi[(unsigned long) dir_i   * N + j[i]];
+        fhn_FX[i + 1] = fi[(unsigned long) dir_ip1 * N + j[0]];
+    }
+
+    // FluidX3D stores DDFs shifted by the rest weight (perturbation method /
+    // DDF-shifting): fi_stored = f_physical - w_i (see calculate_rho_u() in
+    // kernel.cpp, which adds 1.0 back to rho). Undo the shift to recover the
+    // physical populations. FluidX3D D2Q9 weights (w() in kernel.cpp): index 0
+    // = 4/9, axis dirs 1-4 = 1/9, diagonal dirs 5-8 = 1/36.
+    static const float w_FX[Q] = {
+        4.0f/9.0f, 1.0f/9.0f, 1.0f/9.0f, 1.0f/9.0f, 1.0f/9.0f,
+        1.0f/36.0f, 1.0f/36.0f, 1.0f/36.0f, 1.0f/36.0f
+    };
+    for (int i = 0; i < Q; ++i) fhn_FX[i] += w_FX[i];
+}
+
 // ---- V1 hook ----
 
 namespace {
@@ -117,15 +165,65 @@ void open_csv_if_needed(V1Hook& hook) {
 
 } // anonymous namespace
 
+bool v1_hook_should_sample(const V1Hook& hook, unsigned long long step) {
+    if (hook.csv_path == nullptr) return false;
+    if (step < hook.sample_step_start) return false;
+    return ((step - hook.sample_step_start) % hook.sample_cadence) == 0ULL;
+}
+
+namespace {
+
+// One-time validation: reconstruct rho/u at an interior row and compare to
+// FluidX3D's own device fields. At interior (non-wall) cells, collision
+// conserves mass and momentum, so the post-collision reconstruction must
+// reproduce FluidX3D's rho[n] and u[n] (computed by update_fields() through
+// the correct Esoteric-Pull indexing). A gross mismatch means the read-back
+// indexing or the time-step parity is wrong. Non-circular: the reference is
+// FluidX3D's own kernel output, not our synthetic data.
+void validate_readback(V1Hook& hook, unsigned long long t_store,
+                       const float* fi_raw, unsigned long N,
+                       const float* rho_fx, const float* u_fx) {
+    const int Nx = hook.Nx, Ny = hook.Ny;
+    const int y_val = Ny / 2; // interior row, away from both walls
+    const int x_lo = hook.corner_buffer;
+    const int x_hi = Nx - 1 - hook.corner_buffer;
+    double max_drho = 0.0, max_du = 0.0;
+    int n_checked = 0;
+    float fhn_FX[Q];
+    double f_LL[Q];
+    for (int x = x_lo; x <= x_hi; ++x) {
+        const unsigned long cell = (unsigned long) x + (unsigned long) y_val * (unsigned long) Nx;
+        reconstruct_post_collision_D2Q9(fi_raw, N, x, y_val, Nx, Ny, t_store, fhn_FX);
+        fluidx3d_to_LL_D2Q9(fhn_FX, f_LL);
+        double rho_r = 0.0, jx_r = 0.0, jy_r = 0.0;
+        for (int k = 0; k < Q; ++k) { rho_r += f_LL[k]; jx_r += c_x[k]*f_LL[k]; jy_r += c_y[k]*f_LL[k]; }
+        const double ux_r = jx_r / rho_r, uy_r = jy_r / rho_r;
+        const double drho = std::fabs(rho_r - (double) rho_fx[cell]);
+        const double dux  = std::fabs(ux_r  - (double) u_fx[cell]);
+        const double duy  = std::fabs(uy_r  - (double) u_fx[N + cell]);
+        if (drho > max_drho) max_drho = drho;
+        if (dux  > max_du)   max_du   = dux;
+        if (duy  > max_du)   max_du   = duy;
+        ++n_checked;
+    }
+    const double tol = 1e-3; // FP32 populations; this catches indexing/parity errors, not float noise
+    const bool ok = (max_drho < tol) && (max_du < tol);
+    std::fprintf(stderr,
+        "[paper3] read-back validation @ t_store=%llu, interior row y=%d, %d cells: "
+        "max|d_rho|=%.3e max|d_u|=%.3e -> %s\n",
+        t_store, y_val, n_checked, max_drho, max_du, ok ? "PASS" : "FAIL (indexing/parity bug!)");
+    hook.readback_validated = true;
+}
+
+} // anonymous namespace
+
 bool v1_hook_tick(V1Hook& hook,
                   unsigned long long step,
-                  const float* f_fluidx3d,
-                  unsigned long N) {
-    if (hook.csv_path == nullptr) return false;
-
-    // Skip until first scheduled sample, then sample every cadence steps.
-    if (step < hook.sample_step_start) return false;
-    if (((step - hook.sample_step_start) % hook.sample_cadence) != 0ULL) return false;
+                  const float* fi_raw,
+                  unsigned long N,
+                  const float* rho_fx,
+                  const float* u_fx) {
+    if (!v1_hook_should_sample(hook, step)) return false;
 
     open_csv_if_needed(hook);
     if (hook.csv_handle == nullptr) return false;
@@ -137,6 +235,7 @@ bool v1_hook_tick(V1Hook& hook,
     const int x_hi = Nx - 1 - hook.corner_buffer;
     const double cs = std::sqrt(cs2);
     const double Ma = hook.u_w / cs;
+    const unsigned long long t_store = step - 1ULL; // t passed to store_f for the data now in fi_raw
 
     if (y < 0 || y >= Ny) {
         std::fprintf(stderr, "[paper3] WARNING: wall_y=%d out of range [0, %d).\n", y, Ny);
@@ -147,19 +246,21 @@ bool v1_hook_tick(V1Hook& hook,
         return false;
     }
 
+    // One-time read-back validation against FluidX3D's own rho/u fields.
+    if (!hook.readback_validated && rho_fx != nullptr && u_fx != nullptr) {
+        validate_readback(hook, t_store, fi_raw, N, rho_fx, u_fx);
+    }
+
     // Accumulate mean / variance over sampled cells via Welford's algorithm.
     double mean = 0.0, M2 = 0.0;
     int n = 0;
     int corner_excluded = 2 * hook.corner_buffer;
 
-    float f_FX[Q];
+    float fhn_FX[Q];
     double f_LL[Q];
     for (int x = x_lo; x <= x_hi; ++x) {
-        const unsigned long cell = (unsigned long) x + (unsigned long) y * (unsigned long) Nx;
-        for (int i = 0; i < Q; ++i) {
-            f_FX[i] = f_fluidx3d[(unsigned long) i * N + cell];
-        }
-        fluidx3d_to_LL_D2Q9(f_FX, f_LL);
+        reconstruct_post_collision_D2Q9(fi_raw, N, x, y, Nx, Ny, t_store, fhn_FX);
+        fluidx3d_to_LL_D2Q9(fhn_FX, f_LL);
         const double eg = compute_eps_g_hat_full(f_LL, hook.tau_plus, Ma);
 
         ++n;

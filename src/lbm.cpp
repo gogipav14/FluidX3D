@@ -1023,13 +1023,22 @@ void LBM::run(const ulong steps, const ulong total_steps) { // initializes the L
 		do_time_step();
 		info.update(clock.stop());
 #ifdef PAPER3_GHOST_DIAG
-		if(paper3::g_v1_hook.csv_path!=nullptr) {
+		// Gate the expensive full-buffer device read-back on sample steps only.
+		if(paper3::v1_hook_should_sample(paper3::g_v1_hook, get_t())) {
+			if(get_D()!=1u) print_error("PAPER3_GHOST_DIAG only supports single-GPU (D=1).");
+			const ulong N = (ulong)get_Nx()*(ulong)get_Ny()*(ulong)get_Nz();
+			// Refresh rho/u from the current fi via FluidX3D's own (correct) indexing,
+			// so the hook's one-time read-back validation has a ground-truth reference.
+			update_fields();
+			lbm_domain[0]->rho.read_from_device();
+			lbm_domain[0]->u.read_from_device();
 			Memory<fpxx>& fi_buf = lbm_domain[0]->get_fi_buffer();
 			fi_buf.add_host_buffer(); // idempotent: allocates + reads on first call, no-op otherwise
 			fi_buf.read_from_device();
 			paper3::v1_hook_tick(paper3::g_v1_hook, get_t(),
-				(const float*)fi_buf.data(),
-				(unsigned long)get_Nx()*(unsigned long)get_Ny()*(unsigned long)get_Nz());
+				(const float*)fi_buf.data(), N,
+				(const float*)lbm_domain[0]->rho.data(),
+				(const float*)lbm_domain[0]->u.data());
 		}
 #endif // PAPER3_GHOST_DIAG
 	}

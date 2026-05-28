@@ -115,6 +115,25 @@ inline constexpr int ll_to_fx[Q] = {0, 1, 3, 2, 4, 5, 8, 6, 7};
 // ordering. `f_LL[k]` receives the value of `f_FX[ll_to_fx[k]]`.
 void fluidx3d_to_LL_D2Q9(const float f_FX[Q], double f_LL[Q]);
 
+// ---- Esoteric-Pull post-collision DDF reconstruction ----
+//
+// FluidX3D stores DDFs with the Esoteric-Pull in-place streaming scheme, so
+// the raw device buffer is NOT a naive fi[i*N + n] SoA array of post-collision
+// populations. store_f() (kernel.cpp) scatters each post-collision population
+// fhn[i] to a location that depends on the antipode pairing, the neighbor
+// index j[i], and the time-step parity. To recover cell n's post-collision
+// populations on the host we must invert store_f() exactly.
+//
+// This reconstructs the post-collision DDF vector fhn[] (FluidX3D direction
+// ordering) for the 2D cell (x, y), reading from the raw device buffer `fi`
+// (FP32, index_f(n,i) = i*N + n). `t_store` is the time-step value that was
+// passed to store_f() for the data currently in `fi` -- i.e. get_t() - 1 after
+// do_time_step() returns. Periodic boundaries in x and y, matching neighbors().
+void reconstruct_post_collision_D2Q9(const float* fi, unsigned long N,
+                                     int x, int y, int Nx, int Ny,
+                                     unsigned long long t_store,
+                                     float fhn_FX[Q]);
+
 // Inverse: pack a Lallemand-Luo-ordered 9-vector into FluidX3D ordering.
 // Used in synthetic-test construction only.
 void LL_to_fluidx3d_D2Q9(const double f_LL[Q], float f_FX[Q]);
@@ -139,18 +158,31 @@ struct V1Hook {
     // Internal state
     void* csv_handle = nullptr;       // FILE* (kept as void* to keep <cstdio> out of header)
     unsigned int n_samples_taken = 0;
+    bool readback_validated = false;  // set true after the one-time rho/u cross-check
 };
 
-// Sample at the wall-adjacent row of cells if `step` matches the configured
-// cadence. Returns true if a sample was taken (and appended to CSV).
+// Cheap test: would `step` trigger a sample? Lets the caller avoid an expensive
+// full-buffer device read-back on non-sample steps.
+bool v1_hook_should_sample(const V1Hook& hook, unsigned long long step);
+
+// Sample the wall-adjacent row of cells at `step` (caller should gate on
+// v1_hook_should_sample first). Returns true if a sample was taken and
+// appended to CSV.
 //
-// `f_fluidx3d` is the host-side population buffer in FluidX3D D2Q9 SoA layout:
-// f_fluidx3d[i*N + (x + y*Nx)] for direction i, cell (x, y). Caller is
-// responsible for having read it back from the device first.
+// `fi_raw` is the raw Esoteric-Pull device buffer (FP32), read back to host;
+// reconstruct_post_collision_D2Q9() recovers the true post-collision
+// populations from it. `t_store` = step - 1 (the t passed to store_f).
+//
+// If `rho_fx` and `u_fx` are non-null, the FIRST sample additionally validates
+// the read-back: it reconstructs rho/u at a row of interior cells and checks
+// them against FluidX3D's own device fields (which use the correct indexing).
+// `rho_fx[n]` is density; `u_fx` is AoS with u_x at [0,N), u_y at [N,2N).
 bool v1_hook_tick(V1Hook& hook,
                   unsigned long long step,
-                  const float* f_fluidx3d,
-                  unsigned long N);
+                  const float* fi_raw,
+                  unsigned long N,
+                  const float* rho_fx = nullptr,
+                  const float* u_fx = nullptr);
 
 // Close the CSV. Called manually at end of simulation; safe to skip on crash.
 void v1_hook_close(V1Hook& hook);

@@ -8,10 +8,10 @@
 // empty, which is the desired behaviour for make.sh / the FluidX3D build that
 // globs src/*.cpp (FluidX3D already has its own main() in main.cpp).
 //
-// Expected output: 32 PASS, 0 FAIL. eps_g_hat target = 5/18 to machine
-// precision under synthetic Ladd top-wall x-motion injection. Tests 7-9
-// additionally exercise the FluidX3D-ordering translation and V1Hook
-// CSV pipeline used inside FluidX3D.
+// Expected output: 34 PASS, 0 FAIL. eps_g_hat target = 5/18 to machine
+// precision under synthetic Ladd top-wall x-motion injection. Tests 7-10
+// additionally exercise the FluidX3D-ordering translation, the Esoteric-Pull
+// post-collision reconstruction (both parities), and the V1Hook CSV pipeline.
 //
 // Conventions and target derivation: plans/paper3_d2q9_face_wall_derivation.md.
 
@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
+#include <initializer_list>
 
 namespace {
 
@@ -34,6 +35,42 @@ void check(const char* name, double val, double expected, double tol) {
     std::printf("  %-58s = %.10f  (target %.10f, err %.2e)  %s\n",
                 name, val, expected, err, ok ? "PASS" : "FAIL");
     if (ok) ++n_pass; else ++n_fail;
+}
+
+// Mirror store_f() (kernel.cpp) to build a raw Esoteric-Pull device buffer from
+// a spatially uniform post-collision field fhn_FX (FluidX3D direction order),
+// for the given time-step parity. Because the field is uniform, every slot
+// receives the same component no matter which cell wrote it, so
+// reconstruct_post_collision_D2Q9() must recover fhn_FX at any cell. This lets
+// the offline self-test exercise the exact indexing path the live hook uses.
+void store_f_scatter_uniform(float* raw, unsigned long N, int Nx, int Ny,
+                             unsigned long long t_store, const float fhn_FX_physical[paper3::Q]) {
+    const int Q = paper3::Q;
+    const bool odd = (t_store % 2ULL) != 0ULL;
+    // Mirror FluidX3D's DDF-shifting: store f_physical - w_i (so reconstruct's
+    // +w_i recovers the physical value). FluidX3D D2Q9 weights by index.
+    static const float w_FX[9] = {
+        4.0f/9.0f, 1.0f/9.0f, 1.0f/9.0f, 1.0f/9.0f, 1.0f/9.0f,
+        1.0f/36.0f, 1.0f/36.0f, 1.0f/36.0f, 1.0f/36.0f
+    };
+    float fhn_FX[paper3::Q];
+    for (int i = 0; i < Q; ++i) fhn_FX[i] = fhn_FX_physical[i] - w_FX[i];
+    for (int y = 0; y < Ny; ++y) for (int x = 0; x < Nx; ++x) {
+        const unsigned long x0 = (unsigned long) x;
+        const unsigned long xp = (unsigned long)((x + 1) % Nx);
+        const unsigned long xm = (unsigned long)((x + Nx - 1) % Nx);
+        const unsigned long y0 = (unsigned long) y * (unsigned long) Nx;
+        const unsigned long yp = (unsigned long)(((y + 1) % Ny)) * (unsigned long) Nx;
+        const unsigned long ym = (unsigned long)(((y + Ny - 1) % Ny)) * (unsigned long) Nx;
+        unsigned long j[9];
+        j[0]=x0+y0; j[1]=xp+y0; j[2]=xm+y0; j[3]=x0+yp; j[4]=x0+ym;
+        j[5]=xp+yp; j[6]=xm+ym; j[7]=xp+ym; j[8]=xm+yp;
+        raw[0u*N + j[0]] = fhn_FX[0];
+        for (int i = 1; i < Q; i += 2) {
+            raw[(unsigned long)(odd ? i+1 : i  )*N + j[i]] = fhn_FX[i];
+            raw[(unsigned long)(odd ? i   : i+1)*N + j[0]] = fhn_FX[i+1];
+        }
+    }
 }
 
 } // anonymous namespace
@@ -216,32 +253,77 @@ int main() {
         std::printf("\n");
     }
 
-    // ---- Test 8: V1Hook on synthetic FluidX3D-ordered Ladd populations -> 5/18 ----
+    // ---- Test 8: Esoteric-Pull reconstruction roundtrip (both parities) ----
     //
-    // Build a 1-row "domain" of N_x=20 cells where every cell carries the
-    // synthetic Ladd steady state in FluidX3D ordering. Run v1_hook_tick and
-    // parse the resulting CSV mean.
+    // Scatter a known post-collision field into a raw buffer exactly as
+    // store_f() does, then reconstruct it with reconstruct_post_collision_D2Q9()
+    // and confirm recovery. This directly tests the indexing/parity logic that
+    // the live hook relies on -- the part the old naive read silently got wrong.
     {
-        std::printf("[Test 8] v1_hook_tick on synthetic FluidX3D-ordered Ladd populations:\n");
-        const int Nx_test = 20;
-        const int Ny_test = 4;       // dummy multi-row layout
-        const int wall_y  = 2;       // sample row
+        std::printf("[Test 8] Esoteric-Pull store_f/reconstruct roundtrip:\n");
+        const int Nx_test = 16, Ny_test = 8;
         const unsigned long N_test = (unsigned long) Nx_test * Ny_test;
 
-        // Build host-side fi buffer in FluidX3D SoA layout: fi[i * N + cell]
         double f_LL[Q];
         build_synthetic_ladd_top_wall_x(0.04, 0.55, f_LL);
-        float f_FX[Q];
-        LL_to_fluidx3d_D2Q9(f_LL, f_FX);
+        float fhn_FX[Q];
+        LL_to_fluidx3d_D2Q9(f_LL, fhn_FX);
 
-        float* host_fi = new float[Q * N_test];
-        // Fill all cells with the synthetic state; sampling will only touch wall_y row.
-        for (unsigned long n = 0; n < N_test; ++n) {
-            for (int i = 0; i < Q; ++i) host_fi[(unsigned long)i * N_test + n] = f_FX[i];
+        for (unsigned long long t_store : {0ULL, 1ULL}) { // even and odd parity
+            float* raw = new float[Q * N_test];
+            for (unsigned long k = 0; k < (unsigned long)Q * N_test; ++k) raw[k] = -999.0f; // poison
+            store_f_scatter_uniform(raw, N_test, Nx_test, Ny_test, t_store, fhn_FX);
+
+            // Reconstruct at an interior cell and a wall-adjacent cell.
+            double max_err = 0.0;
+            for (int y : {Ny_test/2, Ny_test-2}) {
+                for (int x : {5, 8, 11}) {
+                    float rec[Q];
+                    reconstruct_post_collision_D2Q9(raw, N_test, x, y, Nx_test, Ny_test, t_store, rec);
+                    for (int i = 0; i < Q; ++i) {
+                        const double err = std::abs((double)rec[i] - (double)fhn_FX[i]);
+                        if (err > max_err) max_err = err;
+                    }
+                }
+            }
+            char name[80];
+            std::snprintf(name, sizeof(name), "t_store parity %llu: max|rec - fhn| ~ 0", t_store);
+            check(name, max_err, 0.0, 1e-6);
+            delete[] raw;
         }
+        std::printf("\n");
+    }
+
+    // ---- Test 9: v1_hook_tick on a real Esoteric-Pull buffer -> 5/18 ----
+    //
+    // Build the raw device buffer via store_f scatter (not naive layout), drive
+    // the cadence logic, and confirm the hook reconstructs and reports 5/18.
+    // Also exercises the rho/u read-back validation path (interior reconstructs
+    // to rho=1, u=0 for this momentum-neutral synthetic field).
+    {
+        std::printf("[Test 9] v1_hook_tick on Esoteric-Pull buffer -> 5/18:\n");
+        const int Nx_test = 20;
+        const int Ny_test = 4;
+        const int wall_y  = 2;
+        const unsigned long N_test = (unsigned long) Nx_test * Ny_test;
+
+        double f_LL[Q];
+        build_synthetic_ladd_top_wall_x(0.04, 0.55, f_LL);
+        float fhn_FX[Q];
+        LL_to_fluidx3d_D2Q9(f_LL, fhn_FX);
+
+        // Sample steps will be 100 and 150 -> t_store = 99, 149 (both odd).
+        float* raw = new float[Q * N_test];
+        store_f_scatter_uniform(raw, N_test, Nx_test, Ny_test, /*t_store parity*/99ULL, fhn_FX);
+
+        // FluidX3D reference fields: this synthetic field is momentum-neutral, so
+        // rho=1, u=0 everywhere. Reconstruction must match -> validation PASS.
+        float* rho_fx = new float[N_test];
+        float* u_fx   = new float[3 * N_test];
+        for (unsigned long n = 0; n < N_test; ++n) { rho_fx[n] = 1.0f; u_fx[n] = 0.0f; u_fx[N_test+n] = 0.0f; u_fx[2*N_test+n] = 0.0f; }
 
         V1Hook hook;
-        const char* csv_path = "paper3_diag_selftest_test8.csv";
+        const char* csv_path = "paper3_diag_selftest_test9.csv";
         hook.csv_path = csv_path;
         hook.Nx = Nx_test;
         hook.Ny = Ny_test;
@@ -251,21 +333,19 @@ int main() {
         hook.tau_plus = 0.55;
         hook.sample_step_start = 100ULL;
         hook.sample_cadence    = 50ULL;
-        hook.build_hash = "test8";
+        hook.build_hash = "test9";
 
-        // Drive the hook a few times: no sample before 100, sample at 100/150/200.
-        bool took0  = v1_hook_tick(hook,  50ULL, host_fi, N_test);
-        bool took1  = v1_hook_tick(hook, 100ULL, host_fi, N_test);
-        bool took2  = v1_hook_tick(hook, 150ULL, host_fi, N_test);
-        bool took3  = v1_hook_tick(hook, 130ULL, host_fi, N_test); // off-cadence
+        bool took0 = v1_hook_tick(hook,  50ULL, raw, N_test, rho_fx, u_fx);
+        bool took1 = v1_hook_tick(hook, 100ULL, raw, N_test, rho_fx, u_fx);
+        bool took2 = v1_hook_tick(hook, 150ULL, raw, N_test, rho_fx, u_fx);
+        bool took3 = v1_hook_tick(hook, 130ULL, raw, N_test, rho_fx, u_fx); // off-cadence
         v1_hook_close(hook);
 
-        check("step=50 < start: no sample taken",       (double)took0, 0.0, 1e-12);
-        check("step=100 (= start): sample taken",       (double)took1, 1.0, 1e-12);
+        check("step=50 < start: no sample taken",         (double)took0, 0.0, 1e-12);
+        check("step=100 (= start): sample taken",         (double)took1, 1.0, 1e-12);
         check("step=150 (start + cadence): sample taken", (double)took2, 1.0, 1e-12);
-        check("step=130 (off-cadence): no sample taken", (double)took3, 0.0, 1e-12);
+        check("step=130 (off-cadence): no sample taken",  (double)took3, 0.0, 1e-12);
 
-        // Parse the CSV and verify the mean.
         FILE* fp = std::fopen(csv_path, "r");
         if (fp == nullptr) {
             std::printf("  FAIL: could not open %s for verification\n", csv_path);
@@ -283,12 +363,8 @@ int main() {
             std::fclose(fp);
             std::remove(csv_path);
             if (got >= 6) {
-                // Tolerance 1e-6 accounts for float roundoff in the LL <-> FluidX3D
-                // (double -> float -> double) chain; real V1 uses single-precision
-                // populations returned from the GPU.
                 check("CSV row 1 epsilon_g_hat_mean = 5/18", mean_v, TARGET, 1e-6);
                 check("CSV row 1 epsilon_g_hat_std ~ 0",     std_v,  0.0,    1e-6);
-                // Expected n_samples = Nx - 2*corner_buffer = 20 - 8 = 12
                 check("CSV row 1 n_samples = Nx - 2*buffer",
                       (double) n_samp_v, (double)(Nx_test - 2*hook.corner_buffer), 1e-12);
             } else {
@@ -297,45 +373,40 @@ int main() {
             }
         }
 
-        delete[] host_fi;
+        delete[] raw; delete[] rho_fx; delete[] u_fx;
         std::printf("\n");
     }
 
-    // ---- Test 9: V1Hook on stationary box (no wall motion) -> 0 ----
+    // ---- Test 10: v1_hook_tick on stationary box (no wall motion) -> 0 ----
     {
-        std::printf("[Test 9] v1_hook_tick on stationary box (rho=1, u=0) -> 0:\n");
+        std::printf("[Test 10] v1_hook_tick on stationary box (rho=1, u=0) -> 0:\n");
         const int Nx_test = 20;
         const int Ny_test = 4;
         const unsigned long N_test = (unsigned long) Nx_test * Ny_test;
 
-        // Build equilibrium at u=0 in LL, translate to FluidX3D.
         double feq_LL[Q];
         compute_feq(1.0, 0.0, 0.0, feq_LL);
         float feq_FX[Q];
         LL_to_fluidx3d_D2Q9(feq_LL, feq_FX);
 
-        float* host_fi = new float[Q * N_test];
-        for (unsigned long n = 0; n < N_test; ++n) {
-            for (int i = 0; i < Q; ++i) host_fi[(unsigned long)i * N_test + n] = feq_FX[i];
-        }
+        // Sample at step=100 -> t_store=99 (odd); scatter at matching parity.
+        float* raw = new float[Q * N_test];
+        store_f_scatter_uniform(raw, N_test, Nx_test, Ny_test, /*t_store parity*/99ULL, feq_FX);
 
         V1Hook hook;
-        const char* csv_path = "paper3_diag_selftest_test9.csv";
+        const char* csv_path = "paper3_diag_selftest_test10.csv";
         hook.csv_path = csv_path;
         hook.Nx = Nx_test;
         hook.Ny = Ny_test;
         hook.wall_y = 2;
         hook.corner_buffer = 4;
-        // Even though u_w=0 makes Ma=0 and the normalization is degenerate,
-        // pick a non-zero u_w for the normalization reference; the moment
-        // perturbation is identically zero so eps_g_hat must be zero.
         hook.u_w = 0.04;
         hook.tau_plus = 0.55;
-        hook.sample_step_start = 0;
-        hook.sample_cadence    = 1;
-        hook.build_hash = "test9";
+        hook.sample_step_start = 100ULL;
+        hook.sample_cadence    = 50ULL;
+        hook.build_hash = "test10";
 
-        v1_hook_tick(hook, 0ULL, host_fi, N_test);
+        v1_hook_tick(hook, 100ULL, raw, N_test);
         v1_hook_close(hook);
 
         FILE* fp = std::fopen(csv_path, "r");
@@ -358,7 +429,7 @@ int main() {
             ++n_fail;
         }
 
-        delete[] host_fi;
+        delete[] raw;
         std::printf("\n");
     }
 
