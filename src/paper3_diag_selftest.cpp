@@ -2,13 +2,20 @@
 // hook math kernel defined in paper3_diag.{hpp,cpp}.
 //
 // Compile and run with:
-//   g++ -std=c++17 -O2 src/paper3_diag.cpp src/paper3_diag_selftest.cpp \
-//       -o paper3_diag_selftest && ./paper3_diag_selftest
+//   g++ -std=c++17 -O2 -DPAPER3_DIAG_SELFTEST_MAIN src/paper3_diag.cpp src/paper3_diag_selftest.cpp -o paper3_diag_selftest && ./paper3_diag_selftest
 //
-// Expected output: 20 PASS, 0 FAIL. eps_g_hat target = 5/18 to machine
-// precision under synthetic Ladd top-wall x-motion injection.
+// The -DPAPER3_DIAG_SELFTEST_MAIN guard is required: without it the file is
+// empty, which is the desired behaviour for make.sh / the FluidX3D build that
+// globs src/*.cpp (FluidX3D already has its own main() in main.cpp).
+//
+// Expected output: 32 PASS, 0 FAIL. eps_g_hat target = 5/18 to machine
+// precision under synthetic Ladd top-wall x-motion injection. Tests 7-9
+// additionally exercise the FluidX3D-ordering translation and V1Hook
+// CSV pipeline used inside FluidX3D.
 //
 // Conventions and target derivation: plans/paper3_d2q9_face_wall_derivation.md.
+
+#ifdef PAPER3_DIAG_SELFTEST_MAIN
 
 #include "paper3_diag.hpp"
 
@@ -172,6 +179,191 @@ int main() {
         std::printf("\n");
     }
 
+    // ---- Test 7: FluidX3D <-> Lallemand-Luo translation roundtrip ----
+    {
+        std::printf("[Test 7] FluidX3D <-> Lallemand-Luo translation roundtrip:\n");
+        double f_LL[Q];
+        build_synthetic_ladd_top_wall_x(0.04, 0.55, f_LL);
+        float f_FX[Q];
+        LL_to_fluidx3d_D2Q9(f_LL, f_FX);
+        double f_LL_back[Q];
+        fluidx3d_to_LL_D2Q9(f_FX, f_LL_back);
+
+        double max_err = 0.0;
+        for (int i = 0; i < Q; ++i) {
+            const double err = std::abs(f_LL[i] - f_LL_back[i]);
+            if (err > max_err) max_err = err;
+        }
+        check("roundtrip max |f_LL - f_LL_back| ~ 0", max_err, 0.0, 1e-6);
+
+        // Eps_g after roundtrip must still land at 5/18.
+        const double Ma = 0.04 / cs;
+        const double eg = compute_eps_g_hat_full(f_LL_back, 0.55, Ma);
+        check("eps_g_hat after roundtrip = 5/18", eg, TARGET, 1e-6);
+
+        // Translation table direction check: c_x[ll_to_fx[k]] in FX ordering
+        // should equal c_x[k] in LL ordering (velocity is preserved).
+        constexpr double c_x_FX[Q] = { 0,  1, -1,  0,  0,  1, -1,  1, -1};
+        constexpr double c_y_FX[Q] = { 0,  0,  0,  1, -1,  1, -1, -1,  1};
+        bool dirs_ok = true;
+        for (int k = 0; k < Q; ++k) {
+            const int fx_idx = ll_to_fx[k];
+            if (c_x_FX[fx_idx] != c_x[k]) dirs_ok = false;
+            if (c_y_FX[fx_idx] != c_y[k]) dirs_ok = false;
+        }
+        std::printf("  %-58s = %s\n", "ll_to_fx table preserves velocities", dirs_ok ? "PASS" : "FAIL");
+        if (dirs_ok) ++n_pass; else ++n_fail;
+        std::printf("\n");
+    }
+
+    // ---- Test 8: V1Hook on synthetic FluidX3D-ordered Ladd populations -> 5/18 ----
+    //
+    // Build a 1-row "domain" of N_x=20 cells where every cell carries the
+    // synthetic Ladd steady state in FluidX3D ordering. Run v1_hook_tick and
+    // parse the resulting CSV mean.
+    {
+        std::printf("[Test 8] v1_hook_tick on synthetic FluidX3D-ordered Ladd populations:\n");
+        const int Nx_test = 20;
+        const int Ny_test = 4;       // dummy multi-row layout
+        const int wall_y  = 2;       // sample row
+        const unsigned long N_test = (unsigned long) Nx_test * Ny_test;
+
+        // Build host-side fi buffer in FluidX3D SoA layout: fi[i * N + cell]
+        double f_LL[Q];
+        build_synthetic_ladd_top_wall_x(0.04, 0.55, f_LL);
+        float f_FX[Q];
+        LL_to_fluidx3d_D2Q9(f_LL, f_FX);
+
+        float* host_fi = new float[Q * N_test];
+        // Fill all cells with the synthetic state; sampling will only touch wall_y row.
+        for (unsigned long n = 0; n < N_test; ++n) {
+            for (int i = 0; i < Q; ++i) host_fi[(unsigned long)i * N_test + n] = f_FX[i];
+        }
+
+        V1Hook hook;
+        const char* csv_path = "paper3_diag_selftest_test8.csv";
+        hook.csv_path = csv_path;
+        hook.Nx = Nx_test;
+        hook.Ny = Ny_test;
+        hook.wall_y = wall_y;
+        hook.corner_buffer = 4;
+        hook.u_w = 0.04;
+        hook.tau_plus = 0.55;
+        hook.sample_step_start = 100ULL;
+        hook.sample_cadence    = 50ULL;
+        hook.build_hash = "test8";
+
+        // Drive the hook a few times: no sample before 100, sample at 100/150/200.
+        bool took0  = v1_hook_tick(hook,  50ULL, host_fi, N_test);
+        bool took1  = v1_hook_tick(hook, 100ULL, host_fi, N_test);
+        bool took2  = v1_hook_tick(hook, 150ULL, host_fi, N_test);
+        bool took3  = v1_hook_tick(hook, 130ULL, host_fi, N_test); // off-cadence
+        v1_hook_close(hook);
+
+        check("step=50 < start: no sample taken",       (double)took0, 0.0, 1e-12);
+        check("step=100 (= start): sample taken",       (double)took1, 1.0, 1e-12);
+        check("step=150 (start + cadence): sample taken", (double)took2, 1.0, 1e-12);
+        check("step=130 (off-cadence): no sample taken", (double)took3, 0.0, 1e-12);
+
+        // Parse the CSV and verify the mean.
+        FILE* fp = std::fopen(csv_path, "r");
+        if (fp == nullptr) {
+            std::printf("  FAIL: could not open %s for verification\n", csv_path);
+            ++n_fail;
+        } else {
+            char line[512];
+            if (!std::fgets(line, sizeof(line), fp)) {} // header
+            if (!std::fgets(line, sizeof(line), fp)) {} // first data row
+            double step_v, uw_v, tau_v, ma_v, mean_v, std_v;
+            int n_samp_v, n_corner_v;
+            char hash_buf[64];
+            const int got = std::sscanf(line, "%lf,%lf,%lf,%lf,%lf,%lf,%d,%d,%s",
+                                        &step_v, &uw_v, &tau_v, &ma_v,
+                                        &mean_v, &std_v, &n_samp_v, &n_corner_v, hash_buf);
+            std::fclose(fp);
+            std::remove(csv_path);
+            if (got >= 6) {
+                // Tolerance 1e-6 accounts for float roundoff in the LL <-> FluidX3D
+                // (double -> float -> double) chain; real V1 uses single-precision
+                // populations returned from the GPU.
+                check("CSV row 1 epsilon_g_hat_mean = 5/18", mean_v, TARGET, 1e-6);
+                check("CSV row 1 epsilon_g_hat_std ~ 0",     std_v,  0.0,    1e-6);
+                // Expected n_samples = Nx - 2*corner_buffer = 20 - 8 = 12
+                check("CSV row 1 n_samples = Nx - 2*buffer",
+                      (double) n_samp_v, (double)(Nx_test - 2*hook.corner_buffer), 1e-12);
+            } else {
+                std::printf("  FAIL: CSV parse error (got %d fields)\n", got);
+                ++n_fail;
+            }
+        }
+
+        delete[] host_fi;
+        std::printf("\n");
+    }
+
+    // ---- Test 9: V1Hook on stationary box (no wall motion) -> 0 ----
+    {
+        std::printf("[Test 9] v1_hook_tick on stationary box (rho=1, u=0) -> 0:\n");
+        const int Nx_test = 20;
+        const int Ny_test = 4;
+        const unsigned long N_test = (unsigned long) Nx_test * Ny_test;
+
+        // Build equilibrium at u=0 in LL, translate to FluidX3D.
+        double feq_LL[Q];
+        compute_feq(1.0, 0.0, 0.0, feq_LL);
+        float feq_FX[Q];
+        LL_to_fluidx3d_D2Q9(feq_LL, feq_FX);
+
+        float* host_fi = new float[Q * N_test];
+        for (unsigned long n = 0; n < N_test; ++n) {
+            for (int i = 0; i < Q; ++i) host_fi[(unsigned long)i * N_test + n] = feq_FX[i];
+        }
+
+        V1Hook hook;
+        const char* csv_path = "paper3_diag_selftest_test9.csv";
+        hook.csv_path = csv_path;
+        hook.Nx = Nx_test;
+        hook.Ny = Ny_test;
+        hook.wall_y = 2;
+        hook.corner_buffer = 4;
+        // Even though u_w=0 makes Ma=0 and the normalization is degenerate,
+        // pick a non-zero u_w for the normalization reference; the moment
+        // perturbation is identically zero so eps_g_hat must be zero.
+        hook.u_w = 0.04;
+        hook.tau_plus = 0.55;
+        hook.sample_step_start = 0;
+        hook.sample_cadence    = 1;
+        hook.build_hash = "test9";
+
+        v1_hook_tick(hook, 0ULL, host_fi, N_test);
+        v1_hook_close(hook);
+
+        FILE* fp = std::fopen(csv_path, "r");
+        if (fp != nullptr) {
+            char line[512];
+            if (!std::fgets(line, sizeof(line), fp)) {} // header
+            if (!std::fgets(line, sizeof(line), fp)) {} // data
+            double step_v, uw_v, tau_v, ma_v, mean_v, std_v;
+            int n_samp_v, n_corner_v;
+            char hash_buf[64];
+            std::sscanf(line, "%lf,%lf,%lf,%lf,%lf,%lf,%d,%d,%s",
+                        &step_v, &uw_v, &tau_v, &ma_v, &mean_v, &std_v,
+                        &n_samp_v, &n_corner_v, hash_buf);
+            std::fclose(fp);
+            std::remove(csv_path);
+            check("stationary box: epsilon_g_hat_mean ~ 0", mean_v, 0.0, 1e-12);
+            check("stationary box: epsilon_g_hat_std ~ 0",  std_v,  0.0, 1e-12);
+        } else {
+            std::printf("  FAIL: could not open %s\n", csv_path);
+            ++n_fail;
+        }
+
+        delete[] host_fi;
+        std::printf("\n");
+    }
+
     std::printf("=== Summary: %d passed, %d failed ===\n", n_pass, n_fail);
     return n_fail == 0 ? 0 : 1;
 }
+
+#endif // PAPER3_DIAG_SELFTEST_MAIN

@@ -96,4 +96,68 @@ double compute_eps_g_hat_full(const double f[Q], double tau_plus, double Ma);
 // Used by paper3_diag_selftest.cpp; NOT part of the real V1 LBM run.
 void build_synthetic_ladd_top_wall_x(double u_w, double tau_plus, double f_synth[Q]);
 
+// ---- FluidX3D <-> Lallemand-Luo D2Q9 direction translation ----
+//
+// FluidX3D D2Q9 ordering (from kernel.cpp lines 867-869, antipode-paired):
+//   0=(0,0), 1=(+x,0), 2=(-x,0), 3=(0,+y), 4=(0,-y),
+//   5=(+x,+y), 6=(-x,-y), 7=(+x,-y), 8=(-x,+y)
+//
+// Lallemand-Luo ordering (this file, basis-orthogonal):
+//   0=(0,0), 1=(+x,0), 2=(0,+y), 3=(-x,0), 4=(0,-y),
+//   5=(+x,+y), 6=(-x,+y), 7=(-x,-y), 8=(+x,-y)
+//
+// fx_to_ll[i] = LL index for FluidX3D direction i:
+//   {0, 1, 3, 2, 4, 5, 7, 8, 6}
+inline constexpr int fx_to_ll[Q] = {0, 1, 3, 2, 4, 5, 7, 8, 6};
+inline constexpr int ll_to_fx[Q] = {0, 1, 3, 2, 4, 5, 8, 6, 7};
+
+// Translate a 9-vector indexed by FluidX3D ordering into Lallemand-Luo
+// ordering. `f_LL[k]` receives the value of `f_FX[ll_to_fx[k]]`.
+void fluidx3d_to_LL_D2Q9(const float f_FX[Q], double f_LL[Q]);
+
+// Inverse: pack a Lallemand-Luo-ordered 9-vector into FluidX3D ordering.
+// Used in synthetic-test construction only.
+void LL_to_fluidx3d_D2Q9(const double f_LL[Q], float f_FX[Q]);
+
+// ---- V1 hook (host-side, called from LBM::run() per step) ----
+
+// Diagnostic state carried between time steps for the V1 gate.
+// Configure once in main_setup() (csv_path, geometry, u_w, tau_plus);
+// the LBM time loop drives v1_hook_tick() once per step.
+struct V1Hook {
+    // Configuration (must be set before first sample)
+    const char* csv_path = nullptr;   // if null, hook is disabled
+    int Nx = 0, Ny = 0;               // 2D grid dimensions
+    int corner_buffer = 4;            // exclude this many cells from each x-edge of the wall
+    int wall_y = 0;                   // y-coordinate of the wall-adjacent fluid cell (e.g., Ny-2 for top wall)
+    double u_w = 0.0;                 // top-wall velocity in lattice units
+    double tau_plus = 0.0;            // BGK relaxation time
+    unsigned long long sample_step_start = 100000ULL;
+    unsigned long long sample_cadence  = 5000ULL;
+    const char* build_hash = "unknown";
+
+    // Internal state
+    void* csv_handle = nullptr;       // FILE* (kept as void* to keep <cstdio> out of header)
+    unsigned int n_samples_taken = 0;
+};
+
+// Sample at the wall-adjacent row of cells if `step` matches the configured
+// cadence. Returns true if a sample was taken (and appended to CSV).
+//
+// `f_fluidx3d` is the host-side population buffer in FluidX3D D2Q9 SoA layout:
+// f_fluidx3d[i*N + (x + y*Nx)] for direction i, cell (x, y). Caller is
+// responsible for having read it back from the device first.
+bool v1_hook_tick(V1Hook& hook,
+                  unsigned long long step,
+                  const float* f_fluidx3d,
+                  unsigned long N);
+
+// Close the CSV. Called manually at end of simulation; safe to skip on crash.
+void v1_hook_close(V1Hook& hook);
+
+// Shared V1 hook instance. setup.cpp configures fields before lbm.run();
+// LBM::run() drives v1_hook_tick() once per step against this instance.
+// When csv_path == nullptr (default), the hook is disabled.
+extern V1Hook g_v1_hook;
+
 } // namespace paper3

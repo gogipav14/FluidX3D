@@ -19,6 +19,7 @@
 //#define FORCE_FIELD // enables computing the forces on solid boundaries with lbm.update_force_field(); and enables setting the force for each lattice point independently (enable VOLUME_FORCE too); allocates an extra 12 Bytes/cell
 //#define EQUILIBRIUM_BOUNDARIES // enables fixing the velocity/density by marking cells with TYPE_E; can be used for inflow/outflow; does not reflect shock waves
 //#define MOVING_BOUNDARIES // enables moving solids: set solid cells to TYPE_S and set their velocity u unequal to zero
+//#define PAPER3_GHOST_DIAG // Paper 3 V1 ghost-energy hook (host-side); requires D2Q9, MOVING_BOUNDARIES, FP32 (no FP16S/FP16C), no BENCHMARK
 //#define SURFACE // enables free surface LBM: mark fluid cells with TYPE_F; at initialization the TYPE_I interface and TYPE_G gas domains will automatically be completed; allocates an extra 12 Bytes/cell
 //#define TEMPERATURE // enables temperature extension; set fixed-temperature cells with TYPE_T (similar to EQUILIBRIUM_BOUNDARIES); allocates an extra 32 (FP32) or 18 (FP16) Bytes/cell
 #define SCALAR // enables passive scalar transport extension; set fixed-concentration cells with TYPE_C; allocates an extra 32 (FP32) or 18 (FP16) Bytes/cell; uses D3Q7 lattice with diffusivity D_scalar passed as alpha in LBM constructor
@@ -108,3 +109,18 @@
 #define GRAPHICS
 #define UPDATE_FIELDS // to prevent flickering artifacts in interactive graphics
 #endif // INTERACTIVE_GRAPHICS || INTERACTIVE_GRAPHICS_ASCII
+
+#ifdef PAPER3_GHOST_DIAG
+#if !defined(D2Q9)
+#error "PAPER3_GHOST_DIAG requires D2Q9 (V1 is a 2D Couette setup). Enable D2Q9 above."
+#endif
+#if !defined(MOVING_BOUNDARIES)
+#error "PAPER3_GHOST_DIAG requires MOVING_BOUNDARIES (the V1 gate measures the Ladd injection)."
+#endif
+#if defined(FP16S) || defined(FP16C)
+#error "PAPER3_GHOST_DIAG requires FP32 populations. Disable FP16S and FP16C above."
+#endif
+#ifdef BENCHMARK
+#error "PAPER3_GHOST_DIAG is incompatible with BENCHMARK (which undefs MOVING_BOUNDARIES)."
+#endif
+#endif // PAPER3_GHOST_DIAG

@@ -1367,7 +1367,7 @@ void main_setup() { // benchmark; required extensions in defines.hpp: BENCHMARK,
 
 
 
-void main_setup() { // Scalar advection-diffusion test; required extensions in defines.hpp: SCALAR
+/*void main_setup() { // Scalar advection-diffusion test; required extensions in defines.hpp: SCALAR
 	// Gaussian blob advected by uniform velocity with diffusion
 	// Tests SCALAR extension: D3Q7 passive scalar transport
 	const float D_scalar = 0.01f; // scalar diffusivity

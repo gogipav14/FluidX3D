@@ -144,6 +144,9 @@ public:
 	float get_beta() const { return beta; } // get thermal expansion coefficient
 	ulong get_t() const { return t; } // get discrete time step in LBM units
 	uint get_velocity_set() const; // get LBM velocity set
+#ifdef PAPER3_GHOST_DIAG
+	Memory<fpxx>& get_fi_buffer() { return fi; } // Paper 3 V1 host-side diagnostic only
+#endif // PAPER3_GHOST_DIAG
 	void set_fx(const float fx) { this->fx = fx; } // set global froce per volume
 	void set_fy(const float fy) { this->fy = fy; } // set global froce per volume
 	void set_fz(const float fz) { this->fz = fz; } // set global froce per volume

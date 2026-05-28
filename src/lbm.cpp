@@ -1,4 +1,7 @@
 #include "lbm.hpp"
+#ifdef PAPER3_GHOST_DIAG
+#include "paper3_diag.hpp"
+#endif
 
 
 
@@ -1019,8 +1022,21 @@ void LBM::run(const ulong steps, const ulong total_steps) { // initializes the L
 		clock.start();
 		do_time_step();
 		info.update(clock.stop());
+#ifdef PAPER3_GHOST_DIAG
+		if(paper3::g_v1_hook.csv_path!=nullptr) {
+			Memory<fpxx>& fi_buf = lbm_domain[0]->get_fi_buffer();
+			fi_buf.add_host_buffer(); // idempotent: allocates + reads on first call, no-op otherwise
+			fi_buf.read_from_device();
+			paper3::v1_hook_tick(paper3::g_v1_hook, get_t(),
+				(const float*)fi_buf.data(),
+				(unsigned long)get_Nx()*(unsigned long)get_Ny()*(unsigned long)get_Nz());
+		}
+#endif // PAPER3_GHOST_DIAG
 	}
 	if(get_D()>1u) for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue(); // wait for everything to finish (multi-GPU only)
+#ifdef PAPER3_GHOST_DIAG
+	paper3::v1_hook_close(paper3::g_v1_hook);
+#endif // PAPER3_GHOST_DIAG
 }
 
 void LBM::update_fields() { // update fields (rho, u, T) manually
