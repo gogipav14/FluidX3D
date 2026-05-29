@@ -168,6 +168,18 @@ struct V1Hook {
     unsigned long long sample_cadence  = 5000ULL;
     bool kick_rest_reference = false; // true: rest-referenced source gate (Paper 1 kick, 5/18);
                                       // false: local-eq F_gh variance (Paper 2 definition)
+    // F_pump control-surface flux pipeline (Lock 1 machinery, validated on V1).
+    // When measure_flux is set, each sample integrates u . n over a control line
+    // and accumulates a time-average. For V1 (2D Couette) the control surface is
+    // a vertical line x = flux_plane: Q = sum_y u_x(flux_plane, y) over fluid rows
+    // [flux_y_lo, flux_y_hi], the volumetric flow rate per unit depth.
+    bool measure_flux = false;
+    int flux_plane = 0;   // x0 of the control line
+    int flux_y_lo = 1;    // first fluid row (inclusive)
+    int flux_y_hi = 0;    // last fluid row (inclusive); set to Ny-2
+    double flux_Q_ref = 0.0; // reference/analytic Q for normalization (0 => report raw)
+    double flux_Q_sum = 0.0;          // accumulator for the time-average
+    unsigned int flux_n_samples = 0;  // number of flux samples accumulated
     const char* build_hash = "unknown";
 
     // Internal state

@@ -114,13 +114,14 @@
 #if !defined(D2Q9)
 #error "PAPER3_GHOST_DIAG requires D2Q9 (V1 is a 2D Couette setup). Enable D2Q9 above."
 #endif
-#if !defined(MOVING_BOUNDARIES)
-#error "PAPER3_GHOST_DIAG requires MOVING_BOUNDARIES (the V1 gate measures the Ladd injection)."
-#endif
+// MOVING_BOUNDARIES is the B_Ladd vs B_geom operator toggle, NOT a hard
+// requirement: defined -> B_Ladd (Ladd velocity-corrected bounce-back, kick
+// -> 5/18 Ma^2); undefined -> B_geom (static halfway bounce-back, kick -> 0).
+// The diagnostic hook works in both modes.
 #if defined(FP16S) || defined(FP16C)
 #error "PAPER3_GHOST_DIAG requires FP32 populations. Disable FP16S and FP16C above."
 #endif
 #ifdef BENCHMARK
-#error "PAPER3_GHOST_DIAG is incompatible with BENCHMARK (which undefs MOVING_BOUNDARIES)."
+#error "PAPER3_GHOST_DIAG is incompatible with BENCHMARK (which undefs all extensions)."
 #endif
 #endif // PAPER3_GHOST_DIAG

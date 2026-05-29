@@ -257,6 +257,21 @@ bool v1_hook_tick(V1Hook& hook,
         validate_readback(hook, t_store, fi_raw, N, rho_fx, u_fx);
     }
 
+    // F_pump control-surface flux pipeline (Lock 1 machinery): integrate u . n
+    // over the control line x = flux_plane and accumulate the time-average.
+    // For V1 (2D Couette) n = x-hat, so Q = sum_y u_x(flux_plane, y).
+    if (hook.measure_flux && u_fx != nullptr) {
+        const int y_lo = hook.flux_y_lo;
+        const int y_hi = (hook.flux_y_hi > 0) ? hook.flux_y_hi : (Ny - 2);
+        double Q = 0.0;
+        for (int yy = y_lo; yy <= y_hi; ++yy) {
+            const unsigned long cell = (unsigned long) hook.flux_plane + (unsigned long) yy * (unsigned long) Nx;
+            Q += (double) u_fx[cell]; // u_x component is the first N entries
+        }
+        hook.flux_Q_sum += Q;
+        hook.flux_n_samples += 1u;
+    }
+
     // Accumulate mean / variance over sampled cells via Welford's algorithm.
     double mean = 0.0, M2 = 0.0;
     int n = 0;
@@ -289,6 +304,20 @@ bool v1_hook_tick(V1Hook& hook,
 }
 
 void v1_hook_close(V1Hook& hook) {
+    if (hook.measure_flux && hook.flux_n_samples > 0u) {
+        const double Q_mean = hook.flux_Q_sum / (double) hook.flux_n_samples;
+        std::fprintf(stderr,
+            "[paper3] F_pump pipeline: time-averaged control-surface flux Q = %.6f "
+            "over %u samples (x=%d, y=[%d,%d])",
+            Q_mean, hook.flux_n_samples, hook.flux_plane, hook.flux_y_lo,
+            (hook.flux_y_hi > 0) ? hook.flux_y_hi : -1);
+        if (hook.flux_Q_ref != 0.0) {
+            std::fprintf(stderr, "; Q_ref=%.6f  Q/Q_ref=%.6f  (rel.err %.3e)",
+                hook.flux_Q_ref, Q_mean / hook.flux_Q_ref,
+                (Q_mean - hook.flux_Q_ref) / hook.flux_Q_ref);
+        }
+        std::fprintf(stderr, "\n");
+    }
     if (hook.csv_handle == nullptr) return;
     std::fclose((FILE*) hook.csv_handle);
     hook.csv_handle = nullptr;

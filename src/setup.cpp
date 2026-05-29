@@ -45,7 +45,7 @@ void main_setup() { // benchmark; required extensions in defines.hpp: BENCHMARK,
 static void paper3_run_translating_wall(const char* csv_path, uint Nx, uint Ny,
 		float u_w, float tau_plus, unsigned long long steps,
 		unsigned long long sample_start, unsigned long long sample_cadence,
-		bool dump_profile, bool rest_reference) {
+		bool dump_profile, bool rest_reference, bool measure_flux=false) {
 	const float nu = (tau_plus - 0.5f) / 3.0f; // nu = c_s^2 (tau_+ - 1/2), c_s^2 = 1/3
 	LBM lbm(Nx, Ny, 1u, nu);
 	const uint NxL=lbm.get_Nx(), NyL=lbm.get_Ny(); parallel_for(lbm.get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lbm.coordinates(n, x, y, z);
@@ -66,6 +66,14 @@ static void paper3_run_translating_wall(const char* csv_path, uint Nx, uint Ny,
 	paper3::g_v1_hook.sample_step_start = sample_start;
 	paper3::g_v1_hook.sample_cadence    = sample_cadence;
 	paper3::g_v1_hook.kick_rest_reference = rest_reference;
+	if(measure_flux) { // F_pump pipeline (Lock 1): control line x=Nx/2, fluid rows 1..Ny-2
+		paper3::g_v1_hook.measure_flux = true;
+		paper3::g_v1_hook.flux_plane = (int)NxL/2;
+		paper3::g_v1_hook.flux_y_lo = 1;
+		paper3::g_v1_hook.flux_y_hi = (int)NyL - 2;
+		// analytic Couette flow rate: sum_{y=1}^{Ny-2} u_w*y/(Ny-1) = u_w*(Ny-2)/2
+		paper3::g_v1_hook.flux_Q_ref = (double)u_w * (double)((int)NyL - 2) / 2.0;
+	}
 	lbm.run(steps);
 	if(dump_profile) {
 		lbm.u.read_from_device();
@@ -101,26 +109,42 @@ void main_setup() { // Paper 3 V1
 	// momentum only in the diagonal populations and subtracting f_eq(u_local) adds a
 	// spurious q_x from the axis directions. The rest reference is the one that maps
 	// to Paper 1's universal source. See plans/paper3_v1_reformulation.md.
-	const bool KICK_TEST = true;
+	const bool KICK_TEST = false; // Step A (operator kick) -- done
+	const bool FLUX_TEST = true;  // Step B (F_pump control-surface pipeline on V1)
 
 	const uint Nx = 64u, Ny = 32u;
 	const float u_w = 0.04f; // Ma = u_w/c_s = 0.0693
 
+	if(FLUX_TEST) {
+		// Step B: validate the F_pump flux machinery on developed V1 Couette.
+		// Control-surface flux Q = sum_y u_x(Nx/2, y) over fluid rows; time-averaged
+		// over the sampled steps; compared to the analytic Couette flow rate
+		// Q_ref = u_w*(Ny-2)/2. Uses B_Ladd (MOVING_BOUNDARIES) for a real moving wall.
+		print_info("=== Paper 3 V1 Step B: F_pump control-surface flux on Couette ===");
+		paper3_run_translating_wall("paper3_v1_flux.csv", Nx, Ny, u_w, 0.55f,
+			/*steps*/350000ull, /*sample_start*/150000ull, /*cadence*/5000ull,
+			/*dump_profile*/false, /*rest_reference*/false, /*measure_flux*/true);
+		return;
+	}
+
 	if(KICK_TEST) {
-		// Sweep tau_+ from production (0.55) to near-collision-free (256). The
-		// near-free case reproduces Paper 1's 5/18; the sweep maps (1-1/tau_+)^2.
-		// Sample every step from get_t()=2 (after the single kick) through the
-		// transient decay, so the CSV shows the kick peak and its streaming decay.
-		const int NTAU = 4;
-		const float TAUS[NTAU]   = { 0.55f, 1.5f, 16.0f, 256.0f };
-		const char* PATHS[NTAU]  = { "paper3_v1_kick_tau0p55.csv", "paper3_v1_kick_tau1p5.csv",
-		                             "paper3_v1_kick_tau16.csv",   "paper3_v1_kick_tau256.csv" };
-		for(int k=0; k<NTAU; k++) {
-			print_info("=== Paper 3 V1 kick test (rest ref): tau_+ = "+to_string(TAUS[k], 4u)+" ===");
-			paper3_run_translating_wall(PATHS[k], Nx, Ny, u_w, TAUS[k],
-				/*steps*/40ull, /*sample_start*/2ull, /*cadence*/1ull,
-				/*dump_profile*/false, /*rest_reference*/true);
-		}
+		// Step A: operator-distinction kick. The operator is selected at compile
+		// time by MOVING_BOUNDARIES: defined -> B_Ladd (velocity-corrected
+		// bounce-back, kick -> 5/18 Ma^2); undefined -> B_geom (static halfway
+		// bounce-back, no O(u_w) population term, kick -> ~0). Build twice and
+		// compare the operator-tagged CSVs.
+		// Near-collision-free tau_+ = 256 isolates the source (Paper 1 Level B);
+		// sample every step from get_t()=2 to show the kick + streaming decay.
+#ifdef MOVING_BOUNDARIES
+		const char* op_csv = "paper3_v1_kick_BLadd_tau256.csv";
+		print_info("=== Paper 3 V1 operator kick: B_Ladd (MOVING_BOUNDARIES on), tau_+=256 ===");
+#else
+		const char* op_csv = "paper3_v1_kick_Bgeom_tau256.csv";
+		print_info("=== Paper 3 V1 operator kick: B_geom (MOVING_BOUNDARIES off), tau_+=256 ===");
+#endif
+		paper3_run_translating_wall(op_csv, Nx, Ny, u_w, 256.0f,
+			/*steps*/40ull, /*sample_start*/2ull, /*cadence*/1ull,
+			/*dump_profile*/false, /*rest_reference*/true);
 		return;
 	}
 
