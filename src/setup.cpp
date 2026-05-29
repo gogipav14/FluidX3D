@@ -39,6 +39,63 @@ void main_setup() { // benchmark; required extensions in defines.hpp: BENCHMARK,
 
 #if defined(PAPER3_GHOST_DIAG)
 #include "paper3_diag.hpp"
+#include <cstdio>
+#include <cmath>
+
+// Paper 3 V2: 2D Taylor-Couette (circular Couette below the Taylor-vortex
+// threshold). Inner cylinder rotates (B_Ladd via MOVING_BOUNDARIES), outer
+// stationary. Bins u_theta(r) over all angles and writes (r, u_theta_meas,
+// u_theta_analytic) to CSV. Tests the pure-slip hypothesis: does the curved-wall
+// slip follow the flat-wall GdH form? eta = R_i/R_o = 0.5, Re_Omega <= 30.
+static void paper3_run_taylor_couette(const char* csv_path, uint N,
+		float tau_plus, float omega, float eta, unsigned long long steps) {
+	const float nu = (tau_plus - 0.5f) / 3.0f;
+	LBM lbm(N, N, 1u, nu);
+	const uint NxL=lbm.get_Nx(), NyL=lbm.get_Ny();
+	const double xc = 0.5*(double)NxL, yc = 0.5*(double)NyL;
+	const double Ro = 0.5*(double)NxL - 2.0;   // outer (stationary) wall radius
+	const double Ri = eta * Ro;                // inner (rotating) wall radius
+	parallel_for(lbm.get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lbm.coordinates(n, x, y, z);
+		const double xr = (double)x + 0.5 - xc, yr = (double)y + 0.5 - yc;
+		const double r = sqrt(xr*xr + yr*yr);
+		if(r > Ro) { lbm.flags[n] = TYPE_S; }                 // outer stationary wall + exterior
+		else if(r < Ri) {                                     // inner rotating cylinder
+			lbm.flags[n] = TYPE_S;
+			lbm.u.x[n] = (float)( omega * yr);                // u = omega*(y,-x): azimuthal, |u|=omega*r
+			lbm.u.y[n] = (float)(-omega * xr);
+		} // else: fluid annulus (rest IC)
+	});
+	lbm.run(steps);
+	lbm.u.read_from_device();
+	// Bin u_theta over all fluid cells by integer radius (angle-averaged profile).
+	const int RB = (int)Ro + 2;
+	std::vector<double> sum(RB, 0.0); std::vector<long> cnt(RB, 0);
+	parallel_for(lbm.get_N(), [&](ulong n) { uint x=0u, y=0u, z=0u; lbm.coordinates(n, x, y, z);
+		const double xr=(double)x+0.5-xc, yr=(double)y+0.5-yc; const double r=sqrt(xr*xr+yr*yr);
+		if(r >= Ri && r <= Ro) {
+			const double ux=(double)lbm.u.x[n], uy=(double)lbm.u.y[n];
+			const double utheta = (-ux*yr + uy*xr)/r; // azimuthal component (signed)
+			const int rb=(int)(r+0.5); if(rb>=0&&rb<RB){ sum[rb]+=utheta; cnt[rb]++; }
+		}
+	});
+	// Analytic circular Couette: u_theta(r) = omega*Ri^2*(Ro^2/r - r)/(Ro^2-Ri^2), clockwise (sign -).
+	FILE* fp = std::fopen(csv_path, "w");
+	if(fp) {
+		std::fprintf(fp, "r,u_theta_meas,u_theta_analytic,Ri,Ro,omega,tau_plus,nu\n");
+		for(int rb=(int)Ri; rb<=(int)Ro; rb++) {
+			if(cnt[rb] < 1) continue;
+			const double um = sum[rb]/(double)cnt[rb];
+			const double rr = (double)rb;
+			const double ua = -omega*Ri*Ri*(Ro*Ro/rr - rr)/(Ro*Ro - Ri*Ri); // clockwise
+			std::fprintf(fp, "%d,%.8e,%.8e,%.4f,%.4f,%.8f,%.6f,%.8f\n", rb, um, ua, Ri, Ro, omega, tau_plus, nu);
+		}
+		std::fclose(fp);
+	}
+	const float Re_Omega = (float)(omega*Ri*(Ro-Ri)/nu);
+	print_info("V2 Taylor-Couette: N="+to_string(N)+" Ri="+to_string((float)Ri,2u)+" Ro="+to_string((float)Ro,2u)
+		+" omega="+to_string(omega,6u)+" Ma_wall="+to_string((float)(omega*Ri/0.57735f),4u)
+		+" Re_Omega="+to_string(Re_Omega,2u)+" -> "+csv_path);
+}
 
 // Helper: configure + run one translating-wall case and dump the hook CSV.
 // Reused by both the kick test and the (retained, refuted) steady gate.
@@ -110,10 +167,39 @@ void main_setup() { // Paper 3 V1
 	// spurious q_x from the axis directions. The rest reference is the one that maps
 	// to Paper 1's universal source. See plans/paper3_v1_reformulation.md.
 	const bool KICK_TEST = false; // Step A (operator kick) -- done
-	const bool FLUX_TEST = true;  // Step B (F_pump control-surface pipeline on V1)
+	const bool FLUX_TEST = false; // Step B (F_pump control-surface pipeline on V1) -- done
+	const bool V2_TEST   = true;  // V2 Taylor-Couette pure-slip hypothesis test
 
 	const uint Nx = 64u, Ny = 32u;
 	const float u_w = 0.04f; // Ma = u_w/c_s = 0.0693
+
+	if(V2_TEST) {
+		// V2: 2D Taylor-Couette below threshold, fixed-(Ma,Re_Omega) acoustic-scaled
+		// refinement sweep. eta=0.5, Re_Omega=10 (< Taylor threshold ~41). Inner
+		// rotates (B_Ladd). Fixed u_wall=Ma*c_s; per N: Ro=N/2-2, Ri=eta*Ro,
+		// gap=Ro-Ri, nu=u_wall*gap/Re_Omega, tau_+=0.5+3nu, omega=u_wall/Ri.
+		// A GdH wall slip grows ~N (relative); a geometric/effective-radius error
+		// shrinks ~1/N. The sweep distinguishes them -> tests the pure-slip hypothesis.
+		// tau_+ sweep at FIXED N (fixed geometry/effective-radius) isolates the GdH
+		// slip (~(tau_+-1/2)^2) from the tau_+-independent geometric offset. Fixed
+		// u_wall (Ma) and omega; nu varies with tau_+ so Re_Omega varies but stays
+		// below threshold, and the steady circular-Couette profile is Re-independent
+		// (Stokes). Pure-slip hypothesis: the tau_+-dependent wall defect scales as
+		// (tau_+-1/2)^2 with the flat-wall GdH coefficient.
+		print_info("=== Paper 3 V2: Taylor-Couette tau_+ sweep at fixed N (pure-slip test) ===");
+		const uint N = 128u; const float eta = 0.5f;
+		const float Ro = 0.5f*(float)N - 2.0f, Ri = eta*Ro, gap = Ro-Ri;
+		const float u_wall = 0.02f, omega = u_wall/Ri; // Ma_wall ~ 0.035, fixed
+		const float TAUS[4] = { 0.6f, 0.8f, 1.0f, 1.4f };
+		const char* PS[4] = { "paper3_v2_tc_tau0p6.csv","paper3_v2_tc_tau0p8.csv",
+		                      "paper3_v2_tc_tau1p0.csv","paper3_v2_tc_tau1p4.csv" };
+		for(int k=0;k<4;k++) {
+			const float nu=(TAUS[k]-0.5f)/3.0f, ReOm=u_wall*gap/nu;
+			print_info("  tau_+="+to_string(TAUS[k],2u)+" Re_Omega="+to_string(ReOm,2u));
+			paper3_run_taylor_couette(PS[k], N, TAUS[k], omega, eta, 200000ull);
+		}
+		return;
+	}
 
 	if(FLUX_TEST) {
 		// Step B: validate the F_pump flux machinery on developed V1 Couette.
